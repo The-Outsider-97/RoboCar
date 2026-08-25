@@ -53,5 +53,8 @@ K_BATTERY_STATE      = "power:state"
 # - Safety manager: speed caps, e-stop, zones under SafetyManager()
 # - Pure Pursuit follower (local controller) under PurePursuit()
 # - RoboCar main orchestrator with the following architecture: Perception → Planning → Execution, with Reasoning + Knowledge enriching context.
-#   And Learning and Adaptive
+#   + Learning and Adaptive with constrain to bounded parameter adaptation with SafetyAgent guardrails.
+# - RoboCar main orchestrator uses Observability Agent for high value in robotics bring-up: trace IDs, loop latency histograms, dropped frame counters, watchdog events.
+# - RoboCar main orchestrator uses Handler Agent as recovery orchestrator (retry sensor read, switch degraded mode, safe stop).
+# - RoboCar main orchestrator uses Evaluation Agent for online KPI scoring: near-miss count, stop distance margin, route tracking error, sensor health score, intervention rate.
 # -------------------------------------------------------------
