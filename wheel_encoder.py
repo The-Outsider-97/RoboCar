@@ -205,24 +205,93 @@ class WheelEncoder:
 __all__ = ["WheelEncoder"]
 
 if __name__ == "__main__":
-    print("\n=== Running RC Wheel Encoder ===\n")
-    printer.status("TEST", "Initializing Encoder test", "info")
+    from pathlib import Path
 
-    encoder = WheelEncoder()
-    print(encoder)
-    print("\n* * * * * Phase 2 * * * * *\n")
+    print("\n=== Running RC Wheel Encoder Self-Test ===\n")
+    printer.status("TEST", "Initializing deterministic encoder self-test", "info")
 
-    name = "ppr"
-    type_ = int
+    class _SelfTestClock:
+        def __init__(self):
+            self.now = 100.0
 
-    validate = encoder._get_validated_param(name, type_, min_val=None, max_val=None)
+        def __call__(self) -> float:
+            return self.now
 
-    # Two-tick simulation: first call primes timing, second produces a speed
-    s1 = encoder.update_from_ticks(ticks_total=100000)
-    time.sleep(11)  # 11s control period
-    s2 = encoder.update_from_ticks(ticks_total=105000)  # +5000 ticks since last
+        def advance(self, seconds: float) -> None:
+            self.now += float(seconds)
 
-    printer.pretty("VALIDATOR", validate, "success" if isinstance(validate, (int, float)) else "error")
-    printer.pretty("UPDATER", f"{s1:.3f} -> {s2:.3f} m/s", "success" if isinstance(s2, (int, float)) else "error")
+    config_path = Path(__file__).resolve().parent / "configs" / "rc_configs.yaml"
+    config = load_global_config(str(config_path), force_reload=True)
+    clock = _SelfTestClock()
 
-    print("\n=== Encoder Demo Completed ===\n")
+    encoder = WheelEncoder(config=config, clock=clock)
+
+    print("\n* * * Phase 1 - Configuration / Baseline * * *\n")
+
+    ppr = encoder._get_validated_param("ppr", min_val=1)
+    baseline = encoder.update_from_ticks(100)
+
+    assert ppr >= 1
+    assert baseline == 0.0
+
+    printer.pretty(
+        "INITIALIZATION",
+        {
+            "ppr": ppr,
+            "baseline_speed_mps": baseline,
+            "health": encoder.health(),
+        },
+        "success",
+    )
+
+    print("\n* * * Phase 2 - Speed Estimation * * *\n")
+
+    clock.advance(0.10)
+    moving = encoder.update_from_ticks(101)
+
+    clock.advance(0.10)
+    stationary = encoder.update_from_ticks(101)
+
+    assert moving > 0.0
+    assert 0.0 <= stationary <= moving
+    assert encoder.health()["samples"] >= 2
+
+    printer.pretty(
+        "SPEED ESTIMATION",
+        {
+            "moving_mps": moving,
+            "filtered_stationary_mps": stationary,
+        },
+        "success",
+    )
+
+    print("\n* * * Phase 3 - Counter Reset / Rejection * * *\n")
+
+    clock.advance(0.10)
+    retained_after_reset = encoder.update_from_ticks(50)
+    reset_health = encoder.health()
+
+    assert reset_health["counter_resets"] == 1
+    assert reset_health["status"] == "degraded"
+    assert retained_after_reset == stationary
+
+    encoder.reset(ticks_total=50)
+
+    clock.advance(0.001)
+    retained_after_invalid = encoder.update_from_ticks(10_000)
+    rejected_health = encoder.health()
+
+    assert retained_after_invalid == 0.0
+    assert rejected_health["rejected_samples"] >= 1
+    assert rejected_health["status"] == "degraded"
+
+    printer.pretty(
+        "FAULT HANDLING",
+        {
+            "counter_reset": reset_health,
+            "overspeed_rejection": rejected_health,
+        },
+        "success",
+    )
+
+    print("\n=== Wheel Encoder Self-Test Passed ===\n")

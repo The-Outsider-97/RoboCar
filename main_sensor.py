@@ -530,17 +530,77 @@ __all__ = [
 
 
 if __name__ == "__main__":
-    print("\n=== Running Sensor Bus ===\n")
-    printer.status("TEST", "Initializing SensorBus", "info")
-    # Quick manual test:
-    bus = SensorBus(port="auto", baud=115200)  # adjust port/baud if needed
+    print("\n=== Running SensorBus Self-Test ===\n")
+    printer.status("TEST", "Initializing deterministic SensorBus self-test", "info")
+
+    print("\n* * * Phase 1 - Protocol Parsing * * *\n")
+
+    json_frame = SensorBus._parse_line(
+        '{"ULTRA_FRONT":0.42,"TOF":315,"HALL":1,"ENCODER_TICKS":12}'
+    )
+    kv_frame = SensorBus._parse_line(
+        "ULTRA_FRONT:0.31,ULTRA_REAR:0.52,TOF:410,HALL:0,ENCODER_TICKS:15"
+    )
+    invalid_frame = SensorBus._parse_line("{}")
+
+    assert json_frame is not None
+    assert json_frame.ultra_front_m == 0.42
+    assert json_frame.tof_mm == 315
+    assert json_frame.hall == 1
+    assert json_frame.encoder_ticks_total == 12
+
+    assert kv_frame is not None
+    assert kv_frame.ultra_front_m == 0.31
+    assert kv_frame.ultra_rear_m == 0.52
+    assert kv_frame.tof_mm == 410
+
+    assert invalid_frame is None
+
+    printer.pretty("JSON PARSER", json_frame.to_dict(), "success")
+    printer.pretty("KV PARSER", kv_frame.to_dict(), "success")
+
+    print("\n* * * Phase 2 - Transport / Publication * * *\n")
+
+    # Deliberately nonexistent port guarantees that this self-test never binds
+    # to an attached Pico. allow_simulation=True then exercises the documented
+    # explicit simulation fallback.
+    bus = SensorBus(
+        port="__robocar_selftest_missing_port__",
+        baud=115200,
+        qmax=4,
+        allow_simulation=True,
+    )
+
+    received = []
+    bus.subscribe(received.append)
+
     try:
         bus.start()
-        print("SensorBus running. Ctrl+C to stop.")
-        while True:
-            time.sleep(1.0)
-    except KeyboardInterrupt:
-        pass
+
+        deadline = time.monotonic() + 1.0
+        while bus.latest() is None and time.monotonic() < deadline:
+            time.sleep(0.02)
+
+        latest = bus.latest()
+        queued = bus.poll_nowait()
+        health = bus.health()
+
+        assert bus.running
+        assert bus.is_simulation
+        assert latest is not None
+        assert queued is not None
+        assert received
+        assert health["frames_received"] >= 1
+        assert health["mode"] == "simulation"
+        assert health["status"] == "simulation"
+
+        printer.pretty("LATEST FRAME", latest.to_dict(), "success")
+        printer.pretty("HEALTH", health, "success")
+
     finally:
         bus.stop()
-    print("\n=== SensorBus Completed ===\n")
+
+    assert not bus.running
+    assert bus.health()["status"] == "stopped"
+
+    print("\n=== SensorBus Self-Test Passed ===\n")

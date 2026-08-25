@@ -418,30 +418,81 @@ __all__ = ["MotionController", "PIDSpeedController"]
 
 
 if __name__ == "__main__":
-    print("\n=== Running RC Controller ===\n")
-    printer.status("TEST", "Initializing Controller test", "info")
+    from pathlib import Path
 
-    motion = MotionController()
-    pid = PIDSpeedController()
-    print(motion)
-    print(pid)
-    print("\n* * * * * Phase 2 - Motion * * * * *\n")
+    print("\n=== Running RC Motion Controller Self-Test ===\n")
+    printer.status("TEST", "Initializing deterministic controller self-test", "info")
 
-    sender = motion.send(throttle=0.2, steer=0.0)
-    status = motion.get_status()
-    printer.pretty("SEND",
-                   f"thr={sender['thr']:.2f}, steer={sender['steer']:.2f}, "
-                   f"thr_us={sender['thr_us']}, steer_us={sender['steer_us']}",
-                   "success" if sender and sender.get("ok") else "error")
-    printer.pretty("STATUS", status, "success" if status["status"] != "faulty" else "error")
+    class _SelfTestPWM:
+        """Minimal in-memory PWM backend; never touches physical hardware."""
 
-    print("\n* * * * * Phase 3 - Speed * * * * *\n")
+        def __init__(self):
+            self.pulses_us = {}
 
-    up1 = pid.update(v_des=100.0, v_meas=0.0)
-    time.sleep(0.02)  # simulate 20 ms control period
-    up2 = pid.update(v_des=100.0, v_meas=0.0)
+        def write_us(self, channel: int, pulse_us: int) -> None:
+            self.pulses_us[int(channel)] = int(pulse_us)
 
-    is_ok = isinstance(up2, (int, float))
-    printer.pretty("UPDATE", f"{up1:.3f} -> {up2:.3f}", "success" if is_ok else "error")
+    config_path = Path(__file__).resolve().parent / "configs" / "rc_configs.yaml"
+    config = load_global_config(str(config_path), force_reload=True)
 
-    print("\n=== Controller Demo Completed ===\n")
+    motion = MotionController(
+        config=config,
+        allow_simulation=True,
+        pwm_backend=_SelfTestPWM(),
+    )
+    pid = PIDSpeedController(config=config)
+
+    try:
+        print("\n* * * Phase 1 - Initialization / Neutral * * *\n")
+
+        initial = motion.get_status()
+        neutral = motion.stop()
+
+        assert initial["backend"] == "pulse_writer"
+        assert neutral["ok"] is True
+        assert motion.get_status()["throttle"] == 0.0
+
+        printer.pretty("MOTION INIT", initial, "success")
+
+        print("\n* * * Phase 2 - PWM Command Path * * *\n")
+
+        command = motion.send(throttle=0.25, steer=-0.50)
+        assert command["ok"] is True
+        assert command["thr"] == 0.25
+        assert command["steer"] == -0.50
+        assert 500 <= command["thr_us"] <= 2500
+        assert 500 <= command["steer_us"] <= 2500
+
+        stopped = motion.stop()
+        assert stopped["ok"] is True
+        assert motion.get_status()["throttle"] == 0.0
+
+        printer.pretty("MOTION COMMAND", command, "success")
+
+        print("\n* * * Phase 3 - PID Controller * * *\n")
+
+        prime = pid.update(v_des=0.50, v_meas=0.0)
+        time.sleep(0.01)
+        output = pid.update(v_des=0.50, v_meas=0.0)
+        rejected = pid.safe_update(v_des=float("nan"), v_meas=0.0)
+
+        assert prime == 0.0
+        assert pid.u_min <= output <= pid.u_max
+        assert rejected == 0.0
+
+        printer.pretty(
+            "PID",
+            {
+                "prime": prime,
+                "controlled_output": output,
+                "invalid_input_fallback": rejected,
+            },
+            "success",
+        )
+
+    finally:
+        motion.close()
+
+    assert motion.get_status()["status"] == "stopped"
+
+    print("\n=== Motion Controller Self-Test Passed ===\n")

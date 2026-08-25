@@ -3193,3 +3193,235 @@ __all__ = [
     "RoboCar",
     "astar_path",
 ]
+
+if __name__ == "__main__":
+    print("\n=== Running RoboCar Integrated Self-Test ===\n")
+    printer.status("TEST", "Initializing full RoboCar integration self-test", "info")
+
+    class _SelfTestPWM:
+        """Safe in-memory actuator boundary."""
+
+        def __init__(self):
+            self.pulses_us = {}
+
+        def write_us(self, channel: int, pulse_us: int) -> None:
+            self.pulses_us[int(channel)] = int(pulse_us)
+
+    class _SelfTestMotionController(MotionController):
+        """Use the real controller logic over an in-memory PWM backend."""
+
+        def __init__(self, *, config=None, allow_simulation=False, **kwargs):
+            super().__init__(
+                config=config,
+                allow_simulation=True,
+                pwm_backend=_SelfTestPWM(),
+            )
+
+    _RealMotionController = MotionController
+    car = None
+
+    try:
+        # RoboCar resolves MotionController at construction time. Temporarily
+        # substitute only the hardware backend; all controller logic remains real.
+        MotionController = _SelfTestMotionController
+
+        car = RoboCar(
+            sensor_port="__robocar_selftest_missing_port__",
+            allow_simulation=True,
+            eager_support_agents=True,
+        )
+        car.start()
+
+        print("\n* * * Phase 1 - Runtime / Sensors / Agents * * *\n")
+
+        deadline = time.monotonic() + 1.0
+        while car.sensor_bus.latest() is None and time.monotonic() < deadline:
+            time.sleep(0.02)
+
+        assert car.sensor_bus.latest() is not None
+        assert car.sensor_bus.is_simulation
+        assert {"safety", "execution"}.issubset(car._agents | car._raw_agents)
+
+        printer.pretty(
+            "RUNTIME",
+            {
+                "sensor": car.sensor_bus.health(),
+                "motion": car.motion.get_status(),
+                "agents": sorted(set(car._agents) | set(car._raw_agents)),
+            },
+            "success",
+        )
+
+        print("\n* * * Phase 2 - World Model / Planning / Control * * *\n")
+
+        car.update_pose(
+            PoseState(
+                x_m=0.5,
+                y_m=0.5,
+                yaw_rad=0.0,
+                speed_mps=0.0,
+                confidence=1.0,
+            )
+        )
+
+        grid = OccupancyGrid(
+            width=5,
+            height=5,
+            resolution=1.0,
+            grid=[0] * 25,
+        )
+
+        path = car.plan_local_path(
+            grid,
+            start=(0.5, 0.5),
+            goal=(4.5, 4.5),
+            inflation_radius_m=0.0,
+        )
+
+        assert len(path) >= 2
+
+        car.set_route(
+            [
+                {"x_m": 0.5, "y_m": 0.5, "target_speed_mps": 0.20},
+                {"x_m": 2.5, "y_m": 1.5, "target_speed_mps": 0.20},
+                {"x_m": 4.5, "y_m": 4.5, "target_speed_mps": 0.0},
+            ],
+            route_id="selftest-route",
+            planner_name="robocar.selftest",
+        )
+
+        command = car.compute_trajectory_command()
+
+        assert math.isfinite(command.throttle)
+        assert math.isfinite(command.steering)
+        assert -1.0 <= command.throttle <= 1.0
+        assert -1.0 <= command.steering <= 1.0
+
+        printer.pretty(
+            "PLANNING / CONTROL",
+            {
+                "astar_waypoints": len(path),
+                "trajectory_command": _serialize(command),
+                "world_revision": car.world_model.snapshot().revision,
+            },
+            "success",
+        )
+
+        print("\n* * * Phase 3 - Safety / Execution / Watchdog * * *\n")
+
+        # Exercise SafetyAgent -> ExecutionAgent -> RoboCarRobotAdapter while
+        # remaining physically neutral.
+        execution = car.execute_ackermann_action(
+            throttle=0.0,
+            steering=0.0,
+            duration=0.0,
+            source="robocar.selftest",
+        )
+
+        watchdog = car.service()
+
+        assert isinstance(execution, Mapping)
+        assert car.motion.get_status()["throttle"] == 0.0
+        assert isinstance(watchdog, WatchdogReport)
+
+        printer.pretty(
+            "SAFETY / EXECUTION",
+            {
+                "execution": execution,
+                "watchdog": watchdog.to_dict(),
+            },
+            "success",
+        )
+
+        print("\n* * * Phase 4 - Adaptation / Observability / Evaluation * * *\n")
+
+        # Current default configuration has no adaptation allowlist. A proposal
+        # must therefore be rejected rather than silently becoming tunable.
+        proposal = car.propose_adaptation(
+            parameter="speed.kp",
+            current_value=float(car.speed_controller.kp),
+            proposed_value=float(car.speed_controller.kp) + 0.01,
+            evidence_samples=1,
+            confidence=1.0,
+            source="robocar.selftest",
+            reason="verify deny-by-default adaptation",
+        )
+
+        assert proposal.status.value == "rejected"
+
+        observability = car._emit_observability(
+            event="robocar_selftest",
+            payload={
+                "world_revision": car.world_model.snapshot().revision,
+                "kpis": car.kpi_tracker.snapshot().to_dict(),
+            },
+        )
+
+        assert isinstance(observability, Mapping)
+
+        evaluation = car.evaluate_now(
+            {
+                "agent_performance_metrics": {},
+            }
+        )
+
+        assert isinstance(evaluation, Mapping)
+
+        printer.pretty(
+            "INTELLIGENCE SERVICES",
+            {
+                "adaptation": proposal.to_dict(),
+                "observability_status": observability.get("status"),
+                "evaluation_status": evaluation.get("status"),
+            },
+            "success",
+        )
+
+        print("\n* * * Phase 5 - E-Stop / Handler Recovery * * *\n")
+
+        estop = car.emergency_stop("robocar_selftest")
+        assert car.world_model.snapshot().safety.estop_latched
+
+        car.clear_emergency_stop(operator_confirmed=True)
+        assert not car.world_model.snapshot().safety.estop_latched
+
+        recovery = car.handle_failure(
+            RuntimeError("controlled RoboCar self-test recovery probe"),
+            source="robocar.selftest",
+            target_agent=car._recovery_target,
+            task_data={
+                "operation": "safe_degraded_recovery",
+            },
+            safe_stop=True,
+        )
+
+        assert isinstance(recovery, Mapping)
+        assert car.motion.get_status()["throttle"] == 0.0
+
+        printer.pretty(
+            "RECOVERY",
+            {
+                "emergency_stop": estop,
+                "handler": recovery,
+            },
+            "success",
+        )
+
+        print("\n* * * Phase 6 - Final Health * * *\n")
+
+        health = car.health()
+
+        assert health["started"] is True
+        assert health["world_revision"] > 0
+        assert health["sensor_bus"]["frames_received"] > 0
+
+        printer.pretty("FINAL HEALTH", health, "success")
+
+    finally:
+        if car is not None:
+            car.close()
+
+        # Restore the module-global class even if the self-test fails.
+        MotionController = _RealMotionController
+
+    print("\n=== RoboCar Integrated Self-Test Passed ===\n")
