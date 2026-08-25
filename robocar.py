@@ -54,45 +54,15 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, Mapping, Optional, Sequence, Tuple
 
-from .main_sensor import SensorBus, SensorReading
-from .motion_controller import MotionController, PIDSpeedController
+from .main_sensor import *
+from .motion_controller import *
 from .wheel_encoder import WheelEncoder
-from .modules.edt2d import distance_map_from_occupancy, inflate_obstacles
-from .modules.world_model import (
-    ActuationState,
-    AutonomyState,
-    GNSSState,
-    HealthLevel,
-    ObstacleState,
-    OperatingMode,
-    PoseState,
-    RouteState,
-    SafetyState,
-    SensorHealthState,
-    WaypointState,
-    WorldModel,
-    WorldSnapshot,
-)
-from .modules.trajectory_control import (
-    LongitudinalPIDController,
-    PurePursuitController,
-    TrajectoryCommand,
-    TrajectoryController,
-)
-from .modules.kpi_tracker import KPISnapshot, VehicleKPITracker
-from .modules.watchdog import (
-    VehicleWatchdog,
-    WatchdogEvent,
-    WatchdogInputs,
-    WatchdogReport,
-    WatchdogSeverity,
-    WatchdogThresholds,
-)
-from .modules.adaptation_guard import (
-    AdaptationAuditRecord,
-    AdaptationGuard,
-    ParameterRule,
-)
+from .modules.edt2d import *
+from .modules.world_model import *
+from .modules.trajectory_control import *
+from .modules.kpi_tracker import *
+from .modules.watchdog import *
+from .modules.adaptation_guard import *
 # slai_autonomy is intentionally imported explicitly rather than through
 # modules.__init__.py.  The deterministic modules remain importable without the
 # wider SLAI agent graph, while this composition root intentionally has SLAI.
@@ -103,9 +73,9 @@ from .utils.rc_helpers import *
 
 # RoboCar is expected to live at SLAI/RoboCar.  These are absolute imports from
 # the parent SLAI repository, not ``..src`` relatives.
-from src.agents.agent_factory import AgentFactory
-from src.agents.collaborative.shared_memory import SharedMemory
-from src.agents.execution.actions.robot_actions import (
+from src.agents.agent_factory import AgentFactory # type: ignore
+from src.agents.collaborative.shared_memory import SharedMemory # type: ignore
+from src.agents.execution.actions.robot_actions import ( # type: ignore
     AckermannAction,
     SensorReadAction,
     StopAction,
@@ -851,16 +821,20 @@ class RoboCarRobotAdapter:
                 raw,
                 ("finite x/y/theta", "finite x/y/theta"),
             )
-        values = (raw.get("x"), raw.get("y"), raw.get("theta"))
+        # Keep the validated values explicitly typed for type checkers: values
+        # read from a generic Mapping are otherwise inferred as possibly None.
+        x: Any = raw.get("x")
+        y: Any = raw.get("y")
+        theta: Any = raw.get("theta")
+        values = (x, y, theta)
         if not all(is_finite_number(value) for value in values):
             raise SensorError("pose_estimate", values, ("finite", "finite"))
-        return float(values[0]), float(values[1]), float(values[2])
+        return float(x), float(y), float(theta)
 
 
 # ---------------------------------------------------------------------------
 # RoboCar composition root
 # ---------------------------------------------------------------------------
-
 
 class RoboCar:
     """Physical RoboCar composition root for the current SLAI runtime.
@@ -948,6 +922,17 @@ class RoboCar:
 
         robocar_cfg = get_config_section("robocar", self.config)
         motion_cfg = get_config_section("motion", self.config)
+        lookahead_m = require_finite_float(
+            robocar_cfg.get("lookahead"), "robocar.lookahead", minimum=0.0
+        )
+        wheelbase_m = require_finite_float(
+            robocar_cfg.get("wheelbase"), "robocar.wheelbase", minimum=0.0
+        )
+        max_steer_rad = require_finite_float(
+            motion_cfg.get("servo_max_angle_rad"),
+            "motion.servo_max_angle_rad",
+            minimum=0.0,
+        )
         goal_tolerance = optional_finite_float(
             robocar_cfg.get("goal_tolerance_m"), minimum=0.0
         )
@@ -955,24 +940,24 @@ class RoboCar:
             # Use the deterministic module's established default rather than
             # introducing a second repository default in configuration.
             lateral = PurePursuitController(
-                lookahead_m=robocar_cfg.get("lookahead"),
-                wheelbase_m=robocar_cfg.get("wheelbase"),
-                max_steer_rad=motion_cfg.get("servo_max_angle_rad"),
+                lookahead_m=lookahead_m,
+                wheelbase_m=wheelbase_m,
+                max_steer_rad=max_steer_rad,
             )
         else:
             lateral = PurePursuitController(
-                lookahead_m=robocar_cfg.get("lookahead"),
-                wheelbase_m=robocar_cfg.get("wheelbase"),
-                max_steer_rad=motion_cfg.get("servo_max_angle_rad"),
+                lookahead_m=lookahead_m,
+                wheelbase_m=wheelbase_m,
+                max_steer_rad=max_steer_rad,
                 goal_tolerance_m=goal_tolerance,
             )
         longitudinal = LongitudinalPIDController(pid=self.speed_controller)
         self.trajectory_controller = TrajectoryController(lateral, longitudinal)
         # Compatibility façade; no duplicate control implementation.
         self.pure_pursuit = PurePursuit(
-            lookahead_m=robocar_cfg.get("lookahead"),
-            wheelbase_m=robocar_cfg.get("wheelbase"),
-            max_steer_rad=motion_cfg.get("servo_max_angle_rad"),
+            lookahead_m=lookahead_m,
+            wheelbase_m=wheelbase_m,
+            max_steer_rad=max_steer_rad,
         )
 
         self.kpi_tracker = self._build_kpi_tracker()
@@ -2762,6 +2747,11 @@ class RoboCar:
 
         started = time.monotonic()
         self._autonomy_started_monotonic = started
+        normalized: Dict[str, Any] = {
+            "state": "failed",
+            "succeeded": False,
+            "reason": "autonomy_result_unavailable",
+        }
         try:
             result_obj = self.autonomy_loop.run(goal, context=context)
             result = result_obj.to_dict() if callable(
@@ -3104,7 +3094,7 @@ def astar_path(
         try:
             return bool(inflated[y][x])
         except Exception:
-            return bool(inflated[y, x])
+            return bool(inflated[y][x])
 
     if blocked(start) or blocked(goal):
         raise PlanningError(
