@@ -1,312 +1,332 @@
 # RoboCar
 
-RoboCar is the vehicle-specific hardware and control integration package for an AI-driven Ackermann-steered RC car running under the **SLAI** repository.
+RoboCar is the vehicle-specific hardware, deterministic control, safety, state-management, and **SLAI integration layer** for an AI-driven Ackermann-steered RC car.
 
-The intended deployment layout is deliberately nested:
+It is designed to run as a nested package inside the parent [SLAI](https://github.com/The-Outsider-97/SLAI) repository. RoboCar is **not** a second general AI runtime: SLAI owns agent construction, reasoning, planning, policy-level safety, execution orchestration, recovery, evaluation, observability, and the outer autonomous lifecycle; RoboCar owns the physical vehicle boundary and the deterministic vehicle-domain contracts that must remain explicit, inspectable, and fail-safe.
+
+The current composition root is:
+
+```text
+RoboCar/robocar.py
+```
+
+not the former `robo_car.py` path.
+
+---
+
+## 1. Intended deployment layout
 
 ```text
 SLAI/
-├── rc_main.py                 # RoboCar runtime entry point
-├── RoboCar/                   # this repository
+├── rc_main.py                         # runtime entry point copied from RoboCar/rc_main.py
+├── RoboCar/
+│   ├── README.md
+│   ├── __init__.py
+│   ├── rc_main.py                     # source copy of the SLAI-root launcher
+│   ├── robocar.py                     # composition root / SLAI vehicle boundary
+│   ├── main_sensor.py                 # Pico serial SensorBus + normalized SensorReading
+│   ├── motion_controller.py           # steering/ESC PWM + speed PID
+│   ├── wheel_encoder.py               # accumulated ticks -> filtered wheel speed
 │   ├── configs/
 │   │   └── rc_configs.yaml
-│   ├── hardware/
 │   ├── modules/
-│   │   └── edt2d.py
-│   ├── utils/
-│   │   ├── config_loader.py
-│   │   ├── rc_errors.py
-│   │   └── rc_helpers.py
-│   ├── main_sensor.py
-│   ├── motion_controller.py
-│   ├── wheel_encoder.py
-│   └── robo_car.py
-├── src/                       # SLAI agents/runtime
+│   │   ├── __init__.py
+│   │   ├── adaptation_guard.py
+│   │   ├── edt2d.py
+│   │   ├── kpi_tracker.py
+│   │   ├── slai_autonomy.py
+│   │   ├── trajectory_control.py
+│   │   ├── watchdog.py
+│   │   └── world_model.py
+│   ├── hardware/
+│   │   ├── PCA9685.py
+│   │   ├── gnss.py
+│   │   ├── mpu6050.py
+│   │   ├── nrf24.py
+│   │   ├── adafruit_tlv493d.py
+│   │   ├── adafruit_vl53l0x.py
+│   │   └── ...
+│   └── utils/
+│       ├── config_loader.py
+│       ├── rc_errors.py
+│       └── rc_helpers.py
+├── src/                               # SLAI agents/runtime
 ├── logs/
 └── ...
 ```
 
-RoboCar is **not** a second general AI runtime. The parent SLAI repository owns agent construction, shared memory, high-level reasoning/planning/safety/execution, lifecycle semantics, and broader autonomy. RoboCar owns the physical vehicle boundary: sensor transport, wheel-speed estimation, steering/throttle PWM, local kinematic utilities, deterministic vehicle safety, and adaptation of those capabilities to SLAI.
+`modules/__init__.py` deliberately exports only the deterministic RoboCar-domain modules. `modules.slai_autonomy` is imported explicitly by `robocar.py` so deterministic modules remain importable without eagerly pulling in the wider SLAI agent graph.
 
 ---
 
-## 1. Runtime architecture
+## 2. Runtime architecture
 
 ```mermaid
-flowchart LR
-    Pico["Raspberry Pi Pico\nSensor / IO firmware"]
-    SB["SensorBus\nmain_sensor.py"]
-    SM["SLAI SharedMemory"]
-    LS["Local SafetyManager\nfail-closed vehicle rules"]
-    SA["SLAI SafetyAgent\nhigh-level authorization"]
-    EA["SLAI ExecutionAgent\nAckermannAction / StopAction"]
-    RA["RoboCarRobotAdapter"]
-    MC["MotionController"]
-    PWM["PCA9685"]
-    HW["Steering servo + brushed ESC"]
-    WE["WheelEncoder"]
+flowchart TB
+    subgraph MCU["Raspberry Pi Pico / deterministic IO"]
+        SENSORS["Range / IMU / magnetometer / Hall / encoder ticks"]
+        PICO["Pico firmware"]
+        SENSORS --> PICO
+    end
 
-    Pico -->|serial JSON or KEY:VALUE| SB
-    SB --> SM
+    subgraph VEHICLE["RoboCar deterministic vehicle domain"]
+        SB["SensorBus\nmain_sensor.py"]
+        WE["WheelEncoder"]
+        WM["WorldModel\ntyped authoritative state"]
+        LS["Local SafetyManager"]
+        KPI["VehicleKPITracker"]
+        WD["VehicleWatchdog"]
+        TC["TrajectoryController"]
+        ASTAR["Local A* + EDT2D"]
+        AG["AdaptationGuard"]
+        RA["RoboCarRobotAdapter"]
+        MC["MotionController"]
+    end
+
+    subgraph SLAI["SLAI outer autonomy / reliability"]
+        ACL["AutonomousControlLoop"]
+        REASON["ReasoningAgent"]
+        PLAN["PlanningAgent"]
+        SAFETY["SafetyAgent"]
+        EXEC["ExecutionAgent"]
+        EVAL["EvaluationAgent\nvia RoboCarEvaluationBridge"]
+        OBS["ObservabilityAgent"]
+        HANDLER["HandlerAgent"]
+        KNOW["KnowledgeAgent (optional context)"]
+    end
+
+    ACT["PCA9685 -> steering servo + brushed ESC"]
+
+    PICO -->|"serial JSON / KEY:VALUE"| SB
     SB --> WE
-    WE --> SM
-    SM --> LS
-    LS --> SA
-    SA --> EA
-    EA --> RA
-    RA --> LS
-    RA --> MC
-    MC --> PWM
-    PWM --> HW
+    SB --> WM
+    WE --> WM
+    WM --> LS
+    WM --> KPI
+    WM --> WD
+    WM --> TC
+    ASTAR --> TC
+
+    ACL --> REASON --> PLAN --> SAFETY --> EXEC --> EVAL
+    KNOW -. context .-> REASON
+    WM -. observation .-> ACL
+    KPI -. vehicle KPIs .-> EVAL
+
+    EXEC --> RA
+    LS --> RA
+    RA --> MC --> ACT
+
+    WD -->|"critical: stop first"| MC
+    WD -. recovery after stop .-> HANDLER
+    ACL -. stage failure .-> HANDLER
+    WM -. runtime state .-> OBS
+    KPI -. metrics .-> OBS
+    AG -. SafetyAgent approval before apply .-> SAFETY
 ```
 
-### Responsibility boundary
-
-The split is intentional:
-
-- **Pico:** deterministic sensor acquisition / GPIO-side behavior and any tick accumulation performed by firmware.
-- **Raspberry Pi / RoboCar:** serial ingestion, physical state publication, local geometry, local fail-safe gating, actuator commands.
-- **SLAI:** high-level agent lifecycle, reasoning, planning, safety authorization, execution, recovery, evaluation, observability, and shared memory.
-
-A hardware emergency stop is handled locally and directly. It must not wait for reasoning, planning, a model inference, an agent retry, or a network path.
+The architecture deliberately separates **mission/policy-scale autonomy** from the **fast deterministic vehicle-control path**. SLAI does not replace the local collision, actuator, freshness, or emergency-stop boundary.
 
 ---
 
-## 2. Important implementation invariants
+## 3. Control-domain ownership
 
-### 2.1 Simulation is opt-in
+| Domain | Primary owner | Responsibilities |
+|---|---|---|
+| Physical/hard boundary | RoboCar | serial transport, wheel ticks, PWM, steering, ESC neutral/stop, hardware status |
+| Deterministic vehicle domain | RoboCar | typed world state, local safety, trajectory control, KPI accounting, watchdogs, A*, adaptation guardrails |
+| Outer autonomy | SLAI | reason -> plan -> authorize -> execute -> evaluate |
+| Reliability | SLAI + RoboCar | stop-first local handling, HandlerAgent recovery, degraded-state publication |
+| Assessment | RoboCar + SLAI | vehicle KPI semantics locally; general EvaluationAgent assessment through a bridge |
+| Telemetry | SLAI ObservabilityAgent | non-authoritative traces, throughput, events, bounded runtime reports |
 
-The physical runtime defaults to **fail closed**. If pyserial, a Pico serial device, or the PCA9685 backend is unavailable, startup fails rather than silently synthesizing plausible sensor data or pretending actuator writes succeeded.
+A hardware emergency stop or watchdog-critical condition must not wait for reasoning, planning, model inference, agent retries, or network communication.
 
-Simulation must be explicitly requested:
+---
 
-```bash
-python3 rc_main.py --simulate
+## 4. Safety invariants
+
+The current `robocar.py` enforces several composition-level invariants.
+
+### 4.1 Stop first, recover second
+
+Emergency-stop and watchdog-critical paths command the local motion boundary before invoking SLAI recovery logic.
+
+`HandlerAgent` recovery is therefore not the first safety layer. It operates after a local safe-stop attempt and after RoboCar has entered a degraded or emergency state.
+
+### 4.2 One physical ExecutionAgent
+
+The physical SLAI `ExecutionAgent` is created with:
+
+```python
+robot=RoboCarRobotAdapter(...)
 ```
 
-This is appropriate for development and CI, not for validating physical safety.
+and that same factory-managed instance is reused by `modules/slai_autonomy.py`. RoboCar must not create a second generic/unbound physical execution instance for the same vehicle runtime.
 
-### 2.2 Ackermann kinematics only
+### 4.3 Ackermann actions only
 
-The current chassis is modeled as one steering actuator plus one throttle/ESC actuator. The SLAI integration registers:
+The physical RoboCar execution surface registers:
 
 - `AckermannAction`
 - `StopAction`
 - `SensorReadAction`
 
-It intentionally does **not** expose SLAI's differential-drive `MotorAction`, `SpinAction`, or the current differential-drive `NavigateAction` as physical RoboCar capabilities.
+It intentionally does **not** expose SLAI differential-drive `MotorAction`, `SpinAction`, or `NavigateAction` to this Ackermann vehicle.
 
-### 2.3 Two safety layers, different jobs
+### 4.4 Non-zero throttle is bounded by default
 
-`SafetyManager` and `SafetyAgent` are complementary rather than redundant:
+The current SLAI `AckermannAction` leaves throttle active when `duration == 0`. `RoboCar.execute_ackermann_action()` therefore rejects accidental persistent non-zero throttle unless the caller explicitly opts into persistence.
 
-- **Local SafetyManager:** deterministic e-stop, configured battery thresholds, configured sensor freshness, configured front stop distance, and speed-limit state.
-- **SLAI SafetyAgent:** high-level pre-execution authorization and audit evidence.
-
-A generic AI safety decision is not a substitute for a deterministic collision/power/actuator interlock.
-
-### 2.4 A Hall logic level is not an encoder count
-
-`SensorReading.hall` is the instantaneous digital Hall signal. `WheelEncoder` expects an accumulated tick count. The preferred serial payload therefore optionally includes:
-
-```json
-{"encoder_ticks_total": 12345}
-```
-
-or:
+Autonomous action sequences are stricter: every non-zero Ackermann throttle action must have:
 
 ```text
-ENCODER_TICKS:12345
+duration > 0
 ```
 
-The host does not count occasional serialized Hall levels because that can miss transitions. If the Pico firmware does not yet publish accumulated ticks, another producer may write the existing shared-memory key:
+### 4.5 Simulation is explicit
+
+Physical runtime behavior is fail-closed by default. Missing serial/PWM hardware is not silently replaced by plausible fake success.
+
+Simulation must be explicitly enabled.
+
+### 4.6 Observability is not an actuator authority
+
+Observability failures are recorded as degraded telemetry state but cannot authorize motion, override a stop, clear an e-stop, or transform a denied action into an allowed action.
+
+### 4.7 Adaptation is deny-by-default
+
+An empty adaptation rule set means no parameter is tunable. Safety-critical parameters remain permanently denied even if a caller attempts to propose them.
+
+---
+
+## 5. Core modules
+
+### `robocar.py`
+
+Composition root for:
+
+- configuration resolution;
+- hardware-bound components;
+- `WorldModel`;
+- local deterministic safety;
+- trajectory control;
+- KPI tracking;
+- watchdog supervision;
+- bounded adaptation;
+- SLAI AgentFactory integration;
+- physical `ExecutionAgent` binding;
+- Evaluation, Observability, and Handler integration;
+- outer `AutonomousControlLoop` construction;
+- local A* fallback;
+- e-stop lifecycle;
+- consolidated health reporting.
+
+It deliberately does **not** implement localization or WGS-84 -> local Cartesian conversion.
+
+### `modules/world_model.py`
+
+The authoritative in-process typed state model. `SharedMemory` is retained as an interoperability/mirror surface rather than being the sole domain model.
+
+The world model includes typed state for:
+
+- pose;
+- GNSS;
+- obstacles;
+- route;
+- sensor health;
+- safety;
+- actuation;
+- autonomy mode/lifecycle;
+- bounded domain events.
+
+Metric path/control coordinates are local Cartesian metres. GNSS latitude/longitude is WGS-84 data and must not be fed directly into metric control geometry.
+
+### `modules/trajectory_control.py`
+
+Contains deterministic control laws only:
+
+- `PurePursuitController` for lateral path following;
+- `LongitudinalPIDController` for speed control;
+- `TrajectoryController` for combined command generation.
+
+It does not own hardware, SLAI agents, route planning, geodesy, or safety authorization.
+
+### `modules/kpi_tracker.py`
+
+Computes RoboCar-specific operational semantics locally instead of asking a generic evaluator to invent what vehicle metrics mean.
+
+Tracked quantities can include, when the required calibrated inputs exist:
+
+- obstacle/near-miss margins;
+- stopping-distance margin;
+- cross-track error;
+- heading error;
+- sensor health/availability;
+- GNSS availability;
+- interventions;
+- autonomy/manual ratio;
+- deadline misses;
+- dropped Pico frames;
+- recovery count.
+
+No threshold is fabricated when the corresponding calibration is absent.
+
+### `modules/watchdog.py`
+
+Synchronous watchdog supervision for configured timeouts/fault conditions, including:
+
+- sensor-frame freshness;
+- Pico heartbeat freshness;
+- control-cycle deadline;
+- actuator fault;
+- GNSS freshness when GNSS is required;
+- planner freshness when planning freshness is required.
+
+There is no hidden watchdog thread. The outer process must call `RoboCar.service()` at a stable cadence to enforce critical watchdog events.
+
+### `modules/adaptation_guard.py`
+
+Provides bounded, auditable runtime adaptation with:
+
+- explicit allowlist rules;
+- hard denylist for safety-critical parameters;
+- value bounds;
+- maximum proposal delta;
+- maximum change rate;
+- minimum evidence samples;
+- confidence requirements;
+- SLAI SafetyAgent review;
+- snapshot-before-apply;
+- audit history;
+- rollback.
+
+Adaptation belongs outside the motion-critical loop.
+
+### `modules/slai_autonomy.py`
+
+The only module under `modules/` that intentionally imports the SLAI autonomy stack.
+
+It adapts the current SLAI outer-loop sequence:
 
 ```text
-sensors:encoder:ticks_total
+reason -> plan -> authorize -> execute -> evaluate
 ```
 
-### 2.5 Gear-ratio semantics must match encoder placement
+for RoboCar while reusing the physical vehicle-bound `ExecutionAgent`.
 
-`encoder.gear_ratio` is interpreted as:
+### `modules/edt2d.py`
 
-```text
-input-shaft revolutions / wheel revolutions
-```
-
-Use `1.0` when the encoder directly counts wheel revolutions. Do not change this value solely from the drivetrain gearbox ratio unless the encoder is actually measuring the corresponding upstream shaft.
+Distance-transform and obstacle-inflation support used by local occupancy-grid planning. It retains a pure-Python path when NumPy is unavailable.
 
 ---
 
-## 3. Installation inside SLAI
+## 6. Sensor transport
 
-From the directory where you want SLAI:
+`main_sensor.py` owns the normalized Pico serial boundary through `SensorBus` and `SensorReading`.
 
-```bash
-git clone https://github.com/The-Outsider-97/SLAI.git
-cd SLAI
-git clone https://github.com/The-Outsider-97/RoboCar.git RoboCar
-```
+### Accepted wire formats
 
-Copy `rc_main.py` into the SLAI repository root so it sits beside SLAI's existing `main.py`:
-
-```text
-SLAI/rc_main.py
-```
-
-The RoboCar integration uses absolute imports such as:
-
-```python
-from src.agents.agent_factory import AgentFactory
-from src.agents.collaborative.shared_memory import SharedMemory
-```
-
-That is why `rc_main.py` should be launched from the SLAI root and why `RoboCar/robo_car.py` must not use `from ..src...`.
-
----
-
-## 4. Python dependencies
-
-Install the parent SLAI environment first according to SLAI's own dependency setup.
-
-The current RoboCar repository's `requirements.txt` is empty even though the live modules require additional host packages. For the Raspberry Pi host, the relevant RoboCar-side dependencies are:
-
-```bash
-python3 -m pip install PyYAML pyserial adafruit-blinka adafruit-circuitpython-pca9685
-```
-
-Optional:
-
-```bash
-python3 -m pip install numpy
-```
-
-`modules/edt2d.py` has a pure-Python fallback when NumPy is unavailable.
-
-The bundled legacy `hardware/PCA9685.py` remains a fallback. The corrected `MotionController` first uses the modern CircuitPython PCA9685 API and only then attempts the bundled legacy backend.
-
----
-
-## 5. Required configuration-loader correction
-
-The repository file is named:
-
-```text
-RoboCar/configs/rc_configs.yaml
-```
-
-but the current loader defaults to `RoboCar/configs/rc_config.yaml`. Correct only the path ownership; keep the loader's existing caching/reload logic intact:
-
-```python
-# utils/config_loader.py
-DEFAULT_CONFIG_PATH = (
-    Path(__file__).resolve().parents[1] / "configs" / "rc_configs.yaml"
-)
-
-
-def _resolve_config_path(config_path=None) -> Path:
-    if config_path is None:
-        path = DEFAULT_CONFIG_PATH
-    else:
-        path = Path(config_path).expanduser()
-    return path.resolve()
-```
-
-This works both in the intended `SLAI/RoboCar` layout and when the RoboCar package is inspected standalone.
-
----
-
-## 6. Configuration ownership
-
-The current `rc_configs.yaml` contains both operational sections and a broader hardware inventory. Treat the following as runtime-control sources unless/until the schema is explicitly normalized:
-
-| Section | Runtime responsibility |
-|---|---|
-| `encoder` | PPR, wheel diameter, gear-ratio semantics, speed filter |
-| `motion` | PWM frequency/channels, ESC pulses, servo pulses/angle |
-| `speed` | PID gains and output limits |
-| `power` | battery warning/cutback/critical thresholds |
-| `robocar` | wheelbase, lookahead, map inflation and RoboCar behavior |
-| `hardware` | physical inventory / transport metadata such as Pico serial port |
-
-There are currently duplicated values between `motion`/`encoder` and `hardware`. Do not update only one copy and assume the other is authoritative. A later schema cleanup can remove duplication once ownership is formally decided.
-
-### Optional local-safety keys
-
-The corrected `SafetyManager` only activates these rules when explicitly configured; it does not invent thresholds:
-
-```yaml
-robocar:
-  front_stop_distance_m: 0.30   # example only: choose from measured braking behavior
-  sensor_max_age_s: 0.25        # example only: choose from actual sensor/control timing
-```
-
-The values above are illustrative, **not recommended calibration values**. Determine them experimentally for the actual car, speed envelope, surface, sensor latency, and braking behavior before enabling physical autonomy.
-
----
-
-## 7. Starting the runtime
-
-### Physical hardware
-
-```bash
-cd SLAI
-python3 rc_main.py --port /dev/ttyACM0
-```
-
-If `hardware.pico_serial.port` is already correct in `rc_configs.yaml`, the override is optional:
-
-```bash
-python3 rc_main.py
-```
-
-### Development simulation
-
-```bash
-python3 rc_main.py --simulate
-```
-
-`rc_main.py` deliberately does **not** issue a drive command. Successful startup means the actuator boundary is neutral, sensor ingestion is running, the current SLAI Safety/Execution integration is initialized, and health data can be inspected.
-
----
-
-## 8. Programmatic use
-
-```python
-from RoboCar.robo_car import RoboCar
-
-car = RoboCar(sensor_port="/dev/ttyACM0")
-car.start()
-
-try:
-    result = car.execute_ackermann_action(
-        throttle=0.10,
-        steering=0.0,
-        duration=0.20,
-    )
-    print(result)
-finally:
-    car.close()
-```
-
-For a physical vehicle, keep SLAI safety authorization enabled. The `require_slai_safety=False` argument exists only as an explicit integration/testing escape hatch; it does not disable the local deterministic safety gate.
-
-Emergency stop is direct:
-
-```python
-car.emergency_stop("operator")
-```
-
-Clearing the e-stop only clears the latch; it does not start motion:
-
-```python
-car.clear_emergency_stop()
-```
-
----
-
-## 9. Sensor protocol
-
-### JSON
+#### JSON
 
 ```json
 {
@@ -328,105 +348,768 @@ car.clear_emergency_stop()
 }
 ```
 
-### `KEY:VALUE`
+#### `KEY:VALUE`
 
 ```text
 ULTRA_FRONT:0.42,ULTRA_REAR:0.73,TOF:385,HALL:1,ENCODER_TICKS:4201,VBAT:7.6
 ```
 
-Individual malformed/non-finite measurements are normalized to `None` while the rest of a syntactically valid frame is retained. Transport failures and parser/callback counters are surfaced through `SensorBus.health()`.
+Malformed/non-finite individual measurements become `None` where appropriate while the remainder of a syntactically useful frame can still be retained. Completely empty/non-sensor payloads are rejected.
+
+`SensorBus.health()` exposes transport behavior including received frames, parse errors, transport errors, callback errors, dropped frames, and last-frame age.
+
+### Hall level versus encoder ticks
+
+`SensorReading.hall` is an instantaneous digital Hall level. `WheelEncoder` requires an accumulated tick count.
+
+The preferred Pico payload therefore includes:
+
+```json
+{"encoder_ticks_total": 12345}
+```
+
+or:
+
+```text
+ENCODER_TICKS:12345
+```
+
+Do not count occasional serialized Hall levels on the Raspberry Pi and assume every transition was observed.
 
 ---
 
-## 10. Shared helper primitives
+## 7. GNSS status
 
-`utils/rc_helpers.py` is deliberately dependency-light and contains the mechanics reused across the three core modules:
+`hardware/gnss.py` is present in the repository and provides GNSS parsing/transport support.
 
-- `_to_float`, `_to_int` — retained backward-compatible converters and explicitly exported;
-- finite optional/required numeric conversion;
-- normalized `[-1, 1]` command validation;
-- clamping and low-pass filtering;
-- legacy 12-bit and CircuitPython 16-bit PCA9685 pulse conversion;
-- JSON / comma-separated `KEY:VALUE` decoding;
-- case-insensitive sensor key access;
-- bounded queue insertion;
-- timestamp freshness helpers.
+However, the current `SensorReading` schema in `main_sensor.py` does **not yet** expose GNSS fields, so GNSS is not currently part of the normalized Pico `SensorBus` frame.
 
-It does **not** import NumPy or pandas. That removes unjustified heavyweight dependencies from a module used by hardware-control code.
+`robocar.py` can accept a validated `GNSSState` through its explicit GNSS update boundary, but it does not convert WGS-84 latitude/longitude into local metric pose coordinates.
+
+Therefore the current architecture is:
+
+```text
+GNSS parser / validated fix
+          |
+          v
+      GNSSState
+          |
+          v
+      WorldModel
+```
+
+not:
+
+```text
+GNSS latitude/longitude -> Pure Pursuit coordinates
+```
+
+A deterministic localization/geodesy layer is still required before GNSS can contribute directly to metric path following.
 
 ---
 
-## 11. Local path planning
+## 8. Wheel-speed estimation
 
-`robo_car.py` provides a conservative A* fallback over `OccupancyGrid` and reuses `modules/edt2d.py` for obstacle inflation. This is a **vehicle-local geometric fallback**, not a replacement for SLAI's PlanningAgent.
+`wheel_encoder.py` converts accumulated ticks into filtered wheel speed.
 
-Use SLAI planning when the caller already has a current SLAI planning task:
+`encoder.gear_ratio` means:
+
+```text
+input-shaft revolutions / wheel revolutions
+```
+
+Use `1.0` when the encoder directly measures wheel revolutions. Do not copy the drivetrain gearbox ratio into this field unless the encoder actually measures the corresponding upstream shaft.
+
+Important behavior:
+
+- first sample establishes the timing/tick baseline;
+- unchanged ticks yield zero instantaneous speed and filtered decay;
+- a decreasing counter is treated as a reset/re-baseline, not an invented rollover;
+- implausible/non-finite speed is rejected;
+- rejected samples retain the last valid estimate and surface degraded health.
+
+---
+
+## 9. Motion control
+
+`motion_controller.py` exposes one normalized command boundary:
+
+```python
+motion.send(throttle, steer)
+```
+
+with both values in `[-1, 1]`.
+
+The controller supports:
+
+1. an injected PWM backend, used by deterministic tests;
+2. the modern CircuitPython PCA9685 API;
+3. the bundled legacy `hardware/PCA9685.py` fallback;
+4. explicit in-memory simulation when `allow_simulation=True` and no real backend can be initialized.
+
+Construction commands neutral output. Hardware-write failure triggers best-effort neutralization and is surfaced as an error rather than converted into plausible success.
+
+`PIDSpeedController` provides filtered longitudinal PID control with bounded output and conservative anti-windup behavior.
+
+---
+
+## 10. World state, planning, and trajectory control
+
+### Local A* fallback
+
+`robocar.py` provides an 8-connected A* fallback over `OccupancyGrid`, using `modules/edt2d.py` for obstacle inflation.
+
+This is a concrete local geometric fallback, not a replacement for SLAI `PlanningAgent`.
+
+```python
+path = car.plan_local_path(
+    grid,
+    start=(0.0, 0.0),
+    goal=(2.0, 1.0),
+)
+```
+
+### SLAI planning
+
+When the caller has an SLAI planning task:
 
 ```python
 plan = car.plan_with_slai(planning_task)
 ```
 
-Use local A* when a concrete occupancy map, start pose, and goal position are already available:
+### Route following
 
-```python
-path = car.plan_local_path(grid, start=(0.0, 0.0), goal=(2.0, 1.0))
+The deterministic trajectory layer expects a valid local metric pose and route. It does not infer a geographic transform or invent a desired speed.
+
+Mission-scale SLAI decisions and fast steering/speed control should remain separate:
+
+```text
+SLAI mission decision
+        |
+        v
+route / bounded execution intent
+        |
+        v
+RoboCar deterministic trajectory loop
+        |
+        v
+Safety -> Execution -> hardware
 ```
 
-`PurePursuit.compute_steering()` converts pose/path geometry to a normalized steering command. It intentionally does not invent a speed-to-throttle calibration.
+`run_autonomous()` is not intended to be a 20-50 Hz steering loop.
 
 ---
 
-## 12. Error and degraded-state behavior
+## 11. SLAI integration
 
-| Condition | Correct behavior |
-|---|---|
-| pyserial missing | startup error unless `--simulate` |
-| Pico not found/openable | startup error unless `--simulate` |
-| serial read failure after startup | `SensorBus` becomes degraded; no silent switch to fake data |
-| malformed frame | frame rejected / invalid fields become `None`; counters exposed |
-| subscriber failure | logged and counted without killing the reader thread |
-| PWM driver unavailable | startup error unless simulation explicitly enabled |
-| PWM write fails | immediate `HardwareError`; best-effort neutral command |
-| invalid/non-finite throttle or steering | `ControlError`; never silently accepted |
-| encoder counter decreases | re-baseline; no guessed rollover distance |
-| implausible wheel speed | sample rejected, last valid estimate retained, health degraded |
-| e-stop latched | positive/negative throttle blocked locally; direct stop available |
-| SLAI safety does not approve | no ExecutionAgent drive task is issued |
+### Agent construction
 
----
-
-## 13. Relationship to the old SLAI v2.1 review
-
-The old review remains useful for the architectural principle that high-level autonomy belongs on the Raspberry Pi while deterministic physical control/safety stays near the hardware. However, do not copy its old import paths or assumed interfaces into the current code.
-
-Current SLAI integration uses:
+RoboCar uses the parent SLAI `AgentFactory` and `SharedMemory`:
 
 ```python
 from src.agents.agent_factory import AgentFactory
 from src.agents.collaborative.shared_memory import SharedMemory
 ```
 
-and the existing execution robot-action stack rather than creating a parallel execution-policy abstraction inside RoboCar.
+The nested repository layout is therefore part of the current runtime contract.
 
-The current SLAI `AutonomousControlLoop` is also intended to be the single outer autonomy owner. Do not call `AutonomousControlLoop.from_factory()` unchanged for physical RoboCar actuation until its execution-stage construction can receive the RoboCar robot adapter; the current factory-stage adapter creates its own execution agent without the vehicle adapter.
+### Required physical-autonomy agents
+
+Before physical outer-loop autonomy, RoboCar requires the following SLAI agents to be available:
+
+- Safety;
+- Execution;
+- Reasoning;
+- Planning;
+- Handler;
+- Observability;
+- Evaluation.
+
+Knowledge is available as optional reasoning context through the autonomy adapter.
+
+### Outer autonomy contract
+
+`RoboCar.run_autonomous()` delegates one bounded mission to SLAI's current `AutonomousControlLoop`.
+
+A physical autonomous goal must provide:
+
+- a non-empty objective/name/goal;
+- an explicit mapping-valued `execution_task`;
+- a non-empty supported `action_sequence`;
+- an explicit mapping-valued `evaluation_params`;
+- bounded non-zero Ackermann actions (`duration > 0`).
+
+By default, physical autonomy also requires calibrated local safety readiness.
 
 ---
 
-## 14. Verification before physical autonomous driving
+## 12. Evaluation, Observability, and Handler integration
 
-Static correctness is not equivalent to hardware validation. Before enabling autonomous motion, verify at minimum:
+### Evaluation
+
+Vehicle KPI meanings are owned by `VehicleKPITracker`.
+
+The generic SLAI `EvaluationAgent` remains available for broader evaluation, but RoboCar accesses it through `RoboCarEvaluationBridge`. The bridge preserves the underlying SLAI evaluation result while preventing unrelated generic-domain status from silently becoming the physical vehicle's completion/safety criterion.
+
+Use:
+
+```python
+report = car.evaluate_now(params)
+```
+
+for an explicit evaluation cycle.
+
+### Observability
+
+RoboCar emits bounded runtime events and throughput/latency evidence to `ObservabilityAgent`.
+
+Observability is **best effort and non-authoritative**. Failure to emit telemetry must not grant motion or suppress a local stop.
+
+### Handler
+
+`RoboCar.handle_failure()`:
+
+1. attempts a local hardware stop when requested;
+2. records a recovery KPI;
+3. enters degraded state;
+4. delegates recovery to `HandlerAgent`;
+5. mirrors the recovery result into SharedMemory;
+6. emits observability evidence.
+
+Autonomy stage failures are mapped back to their owning agent so Handler recovery does not receive an unbound/unknown target when a stage returns an explicit failed result.
+
+---
+
+## 13. Watchdog and supervisory cadence
+
+`VehicleWatchdog` is synchronous. `RoboCar.service()` performs one enforcing watchdog iteration:
+
+```python
+report = car.service()
+```
+
+`RoboCar.health()` also produces a watchdog report, but it calls the watchdog in **non-enforcing** mode for diagnostics.
+
+### Current `rc_main.py` integration note
+
+The current launcher periodically calls `car.health()` but does not yet call `car.service()` inside its main loop. Therefore periodic health output alone is **not equivalent to watchdog enforcement**.
+
+Before relying on the watchdog as an active runtime stop mechanism, the launcher loop should service it explicitly:
+
+```python
+while not stopping:
+    car.service()
+
+    if interval > 0.0 and time.monotonic() >= next_health:
+        print(json.dumps(car.health(), default=str, indent=2))
+        next_health = time.monotonic() + interval
+
+    time.sleep(0.05)
+```
+
+The loop cadence must ultimately be chosen from measured runtime/safety requirements; the existing `0.05 s` launcher sleep is not, by itself, a validated control deadline.
+
+Do not configure `pico_heartbeat_timeout_s` until the runtime has a genuinely distinct Pico heartbeat signal. A normal sensor-frame timestamp must not be relabeled as an independent heartbeat without implementing that contract.
+
+---
+
+## 14. Adaptation lifecycle
+
+Adaptation is explicitly separated from motion control.
+
+The supported lifecycle is:
+
+```text
+proposal
+   |
+   v
+rule / evidence / rate validation
+   |
+   v
+SafetyAgent review
+   |
+   v
+snapshot current value
+   |
+   v
+apply
+   |
+   +----> audit
+   |
+   +----> rollback if required
+```
+
+Public composition-root methods include:
+
+```python
+car.propose_adaptation(...)
+car.review_adaptation(...)
+car.apply_adaptation(...)
+car.rollback_adaptation(...)
+```
+
+No adaptation rule means no permission to adapt that parameter.
+
+---
+
+## 15. Configuration ownership
+
+The current `configs/rc_configs.yaml` contains these implemented sections:
+
+| Section | Responsibility |
+|---|---|
+| `main` | reserved/general runtime section |
+| `encoder` | PPR, wheel diameter, gear-ratio semantics, filtering |
+| `motion` | PWM frequency/channels, ESC pulses, servo pulses/angle |
+| `speed` | speed PID gains and output limits |
+| `hardware` | physical inventory and transport metadata |
+| `power` | battery warning/cutback/critical thresholds |
+| `robocar` | wheelbase, lookahead, map inflation and RoboCar behavior |
+
+The file currently duplicates several actuator/encoder values between the runtime sections and `hardware`. Do not update one copy and assume the other is automatically authoritative.
+
+### Safety/watchdog/KPI/adaptation schema
+
+`robocar.py` also understands additional safety-supervision sections, but the current committed YAML does not yet provide calibrated values for them.
+
+A safe **disabled/unset schema** is:
+
+```yaml
+robocar:
+  front_stop_distance_m: null
+  sensor_max_age_s: null
+
+watchdog:
+  sensor_frame_timeout_s: null
+  pico_heartbeat_timeout_s: null
+  control_cycle_deadline_s: null
+  gnss_timeout_s: null
+  gnss_required: false
+  planner_timeout_s: null
+  planner_required: false
+
+kpi:
+  near_miss_distance_m: null
+  reaction_time_s: null
+  max_deceleration_mps2: null
+
+adaptation:
+  rules: {}
+```
+
+`null` here means **not calibrated / not enabled**. It is not a recommended operating value.
+
+Do not replace these values with arbitrary examples. Determine physical safety thresholds from measured vehicle behavior, including braking distance, reaction/control latency, sensor timing, speed envelope, surface conditions, and actuator response.
+
+### Autonomous fail-closed readiness
+
+With the default `require_calibrated_safety=True`, `run_autonomous()` refuses physical mission execution until at least the following are configured:
+
+```text
+robocar.front_stop_distance_m
+robocar.sensor_max_age_s
+watchdog.sensor_frame_timeout_s
+```
+
+It also requires a current sensor frame and blocks when e-stop is latched. If GNSS is configured as required, a valid GNSS state is required as well.
+
+---
+
+## 16. Configuration-loader path mismatch
+
+The repository configuration file is:
+
+```text
+RoboCar/configs/rc_configs.yaml
+```
+
+but the current `utils/config_loader.py` still declares:
+
+```python
+DEFAULT_CONFIG_PATH = "RoboCar/configs/rc_config.yaml"
+```
+
+The composition root defensively resolves the actual repository file directly, and the standalone motion/encoder self-tests also pass an explicit configuration path. The loader default itself should nevertheless be corrected so all callers share one canonical source:
+
+```python
+DEFAULT_CONFIG_PATH = (
+    Path(__file__).resolve().parents[1]
+    / "configs"
+    / "rc_configs.yaml"
+)
+```
+
+and `_resolve_config_path()` should resolve that path directly rather than prepending a second project-root-relative `RoboCar/...` prefix.
+
+Until that correction is committed, code that calls `load_global_config()` without an explicit path can still hit the stale singular filename.
+
+---
+
+## 17. Dependencies
+
+The current `requirements.txt` contains:
+
+```text
+smbus
+pyserial
+```
+
+The codebase also imports `yaml`, so the parent SLAI/Python environment must provide **PyYAML**.
+
+For the modern Raspberry Pi PCA9685 backend, install the CircuitPython host packages when that backend is used:
+
+```bash
+python3 -m pip install adafruit-blinka adafruit-circuitpython-pca9685
+```
+
+The bundled legacy `hardware/PCA9685.py` remains a fallback.
+
+NumPy is optional for `modules/edt2d.py`; a pure-Python fallback exists.
+
+Install and validate the parent SLAI environment first because `robocar.py` also depends on SLAI agents and `logs.logger`.
+
+---
+
+## 18. Installation inside SLAI
+
+```bash
+git clone https://github.com/The-Outsider-97/SLAI.git
+cd SLAI
+git clone https://github.com/The-Outsider-97/RoboCar.git RoboCar
+```
+
+Copy the launcher to the SLAI root if it is not already present there:
+
+```text
+RoboCar/rc_main.py -> SLAI/rc_main.py
+```
+
+The resulting import should be:
+
+```python
+from RoboCar.robocar import RoboCar
+```
+
+Run commands from the SLAI root so the `src`, `logs`, and `RoboCar` packages resolve consistently.
+
+---
+
+## 19. Starting the runtime
+
+### Physical hardware
+
+```bash
+cd SLAI
+python3 rc_main.py --port /dev/ttyACM0
+```
+
+If the configured Pico serial port is correct:
+
+```bash
+python3 rc_main.py
+```
+
+### Explicit simulation
+
+```bash
+python3 rc_main.py --simulate
+```
+
+The launcher does not issue a drive command by itself. Startup initializes the vehicle boundary at neutral and starts sensor/agent infrastructure.
+
+As noted in the watchdog section, the current launcher should additionally call `car.service()` at a suitable supervisory cadence before watchdog enforcement is considered active.
+
+---
+
+## 20. Programmatic use
+
+```python
+from RoboCar.robocar import RoboCar
+
+car = RoboCar(sensor_port="/dev/ttyACM0")
+car.start()
+
+try:
+    result = car.execute_ackermann_action(
+        throttle=0.10,
+        steering=0.0,
+        duration=0.20,
+    )
+    print(result)
+finally:
+    car.close()
+```
+
+A non-zero physical throttle command should remain bounded in duration unless a persistent command is intentionally and explicitly required by the caller.
+
+### Emergency stop
+
+```python
+car.emergency_stop("operator")
+```
+
+Clearing the latch requires explicit operator confirmation:
+
+```python
+car.clear_emergency_stop(operator_confirmed=True)
+```
+
+Clearing an e-stop does **not** command motion or reapply a previous throttle request.
+
+---
+
+## 21. Compact module self-tests
+
+The repository modules include compact executable self-tests intended to validate their complete local contracts without becoming a separate regression-suite framework.
+
+Run them from the SLAI root:
+
+```bash
+python -m RoboCar.motion_controller
+python -m RoboCar.main_sensor
+python -m RoboCar.wheel_encoder
+python -m RoboCar.robocar
+```
+
+On Windows, the equivalent can be run with the environment's configured Python launcher, for example:
+
+```powershell
+py -m RoboCar.motion_controller
+py -m RoboCar.main_sensor
+py -m RoboCar.wheel_encoder
+py -m RoboCar.robocar
+```
+
+### `motion_controller.py`
+
+The self-test uses an injected in-memory PWM backend. It exercises:
+
+- configuration loading;
+- neutral initialization;
+- normalized throttle/steering -> pulse conversion;
+- stop/neutral behavior;
+- PID priming/update;
+- bounded PID output;
+- invalid-input safe fallback;
+- clean close.
+
+It does not intentionally energize the physical servo or ESC.
+
+### `main_sensor.py`
+
+The self-test exercises:
+
+- JSON parsing;
+- `KEY:VALUE` parsing;
+- rejection of empty payloads;
+- explicit simulation fallback through a deliberately nonexistent port;
+- subscriber publication;
+- bounded queue publication;
+- latest-frame state;
+- health counters;
+- clean shutdown.
+
+It deliberately avoids accidentally attaching to a real Pico during the self-test.
+
+### `wheel_encoder.py`
+
+The self-test uses an injected deterministic clock and exercises:
+
+- configuration validation;
+- first-sample baseline;
+- tick-to-speed estimation;
+- filtered stationary behavior;
+- counter-reset handling;
+- implausible-speed rejection;
+- degraded health accounting.
+
+No multi-second sleep is required.
+
+### `robocar.py`
+
+The integrated self-test keeps the physical actuator boundary in memory while exercising the actual composition root, including:
+
+- RoboCar startup;
+- explicit SensorBus simulation;
+- Safety/Execution agent availability;
+- WorldModel updates;
+- local A*;
+- route state;
+- trajectory command generation;
+- neutral Ackermann Safety -> Execution -> RobotAdapter flow;
+- watchdog service;
+- deny-by-default adaptation;
+- Observability integration;
+- Evaluation bridge integration;
+- e-stop latch/confirmed clear;
+- Handler recovery;
+- consolidated health;
+- shutdown.
+
+The integrated self-test intentionally does **not** call a fabricated physical `run_autonomous()` mission merely to make the test pass. Physical autonomy is supposed to fail closed when required calibrated safety values or explicit mission contracts are absent.
+
+---
+
+## 22. Health and degraded-state surfaces
+
+Primary diagnostics include:
+
+```python
+car.health()
+car.sensor_bus.health()
+car.motion.get_status()
+car.encoder.health()
+car.world_model.snapshot()
+car.kpi_tracker.snapshot()
+car.check_watchdog(enforce=False)
+```
+
+`RoboCar.health()` aggregates:
+
+- startup/simulation state;
+- SensorBus health;
+- motion status;
+- encoder health;
+- WorldModel revision/state;
+- KPIs;
+- watchdog health/report;
+- SLAI autonomy-loop health when available;
+- initialized agents;
+- per-agent health;
+- agent initialization/runtime errors;
+- latest Handler/Observability/autonomy results.
+
+Degraded persistence, telemetry, recovery, sensor, or actuator state should be surfaced rather than silently converted into a healthy status.
+
+---
+
+## 23. SharedMemory interoperability
+
+`WorldModel` is the authoritative typed in-process vehicle state, while SLAI `SharedMemory` remains an interoperability and compatibility surface.
+
+RoboCar mirrors important runtime data under keys for areas such as:
+
+- latest sensor frame;
+- encoder ticks/speed;
+- front/rear range;
+- battery state;
+- safety state;
+- current goal/plan;
+- world state;
+- KPI snapshot;
+- watchdog report;
+- autonomy result;
+- observability report;
+- handler recovery result;
+- evaluation report;
+- adaptation audit record.
+
+New deterministic vehicle logic should prefer typed `WorldModel` state over loosely structured SharedMemory reads when both are available.
+
+---
+
+## 24. Current repository boundaries / not yet implemented
+
+The following distinctions are intentional and important for accurate use of the current repository.
+
+### Not yet present as deterministic RoboCar modules
+
+There is currently no committed:
+
+```text
+modules/sensor_fusion.py
+modules/localization.py
+modules/geo.py
+```
+
+Therefore `robocar.py` does not claim to perform full IMU/magnetometer/GNSS sensor fusion or geographic localization.
+
+### GNSS is not yet part of `SensorReading`
+
+`hardware/gnss.py` exists, but the normalized Pico `SensorBus` schema has not yet been extended with GNSS fields.
+
+### Current camera configuration is still OV5647
+
+The committed `rc_configs.yaml` currently declares:
+
+```yaml
+hardware:
+  camera:
+    model: "OV5647"
+```
+
+The repository therefore does not yet document an IMX500/Hailo-8 perception path as implemented runtime behavior.
+
+### No autonomous safety thresholds are calibrated in the committed YAML
+
+`front_stop_distance_m`, `sensor_max_age_s`, and watchdog timing thresholds are not currently committed with measured values. This is deliberate: the runtime should not invent physical safety thresholds.
+
+### Watchdog enforcement is not yet serviced by the current launcher loop
+
+`RoboCar.service()` exists and enforces critical watchdog events, but the committed `rc_main.py` currently performs only periodic `health()` checks. See Section 13.
+
+---
+
+## 25. Error and fail-safe behavior
+
+| Condition | Expected behavior |
+|---|---|
+| pyserial unavailable | startup error unless simulation explicitly allowed |
+| Pico unavailable/open failure | startup error unless simulation explicitly allowed |
+| live serial failure | SensorBus degrades; no silent switch to synthetic data |
+| malformed sensor field | invalid field becomes `None` where possible; rest of useful frame retained |
+| unusable sensor payload | frame rejected |
+| subscriber exception | counted/logged without terminating the reader thread |
+| PWM backend unavailable | startup error unless simulation explicitly allowed |
+| PWM write failure | error + best-effort neutralization |
+| non-finite/out-of-range command | `ControlError`; not silently accepted |
+| encoder counter decrease | re-baseline; no guessed rollover |
+| implausible encoder speed | reject sample; retain last valid estimate; degraded health |
+| e-stop latched | local motion denied; direct stop remains available |
+| SafetyAgent denial | no physical ExecutionAgent action should proceed |
+| watchdog critical event with enforcement | hardware stop first, then event/recovery path |
+| Handler failure | remains degraded/stopped; failure surfaced |
+| Observability failure | telemetry degrades; motion authority unchanged |
+| missing adaptation rule | proposal rejected |
+| missing physical autonomy calibration | `run_autonomous()` fails closed by default |
+
+---
+
+## 26. Verification before physical autonomous driving
+
+Static correctness and simulation success are not physical validation.
+
+Before enabling autonomous motion, verify at minimum:
 
 1. PCA9685 backend and PWM frequency on the actual Raspberry Pi.
 2. ESC neutral/min/max pulses with wheels safely lifted.
 3. Steering direction, center, endpoints, and mechanical binding.
-4. Pico serial frame rate and dropped-frame behavior under load.
-5. Encoder PPR, encoder location, and `gear_ratio` semantics against measured distance.
-6. Wheel diameter against measured travel, not nominal tire labeling alone.
-7. Battery voltage measurement/divider calibration if `vbat` is used.
-8. Stop distance across the intended speed envelope and floor/surface conditions.
-9. Sensor freshness/failure response, including unplugged/blocked ranging sensors.
-10. E-stop operation independently of SLAI agents.
-11. SLAI SafetyAgent approval/block path and ExecutionAgent action registration.
-12. Full shutdown behavior after exceptions, SIGINT, and power/serial faults.
+4. Pico serial frame rate and dropped-frame behavior under realistic load.
+5. Encoder PPR and encoder location against measured wheel travel.
+6. `gear_ratio` semantics against the actual encoder shaft.
+7. Wheel diameter from measured travel rather than tire labeling alone.
+8. Battery-voltage acquisition/calibration if `vbat` drives protection logic.
+9. Sensor latency, range validity, blind zones, and failure behavior.
+10. Braking/stopping distance over the intended speed envelope and surfaces.
+11. Sensor-freshness limits derived from measured acquisition/control timing.
+12. E-stop behavior independent of SLAI reasoning/agent availability.
+13. SafetyAgent allow/deny behavior at the ExecutionAgent boundary.
+14. Watchdog enforcement through a real `car.service()` runtime cadence.
+15. Handler recovery after actuator/sensor/planner failures.
+16. Observability failure without loss of local safety authority.
+17. Evaluation output without treating generic evaluator semantics as vehicle safety truth.
+18. Adaptation rejection/approval/apply/rollback with a deliberately bounded non-critical parameter.
+19. GNSS validity and geodesy/localization once those paths are integrated.
+20. Shutdown after exceptions, SIGINT/SIGTERM, serial faults, and actuator faults.
 
-Only after those measurements should physical thresholds be selected and autonomy speed limits increased.
+Only after measured evidence exists should physical thresholds, control deadlines, speed limits, or adaptation rules be enabled.
+
+---
+
+## 27. Design principle
+
+The project follows one central systems rule:
+
+> **Use SLAI for high-level intelligence and orchestration; keep time-critical physical truth, safety, state, and control deterministic, explicit, and locally enforceable.**
+
+That separation allows RoboCar to become more intelligent without making basic vehicle safety dependent on an AI inference, an opaque recovery path, or an unverified runtime assumption.
