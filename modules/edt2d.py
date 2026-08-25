@@ -240,3 +240,13 @@ def inflate_obstacles(distance_map_m, inflation_radius_m: float):
             for x in range(W):
                 mask[y][x] = (float(row[x]) < r)
         return mask
+
+
+__all__ = [
+ "_zeros",
+ "_edt_1d",
+ "edt2d_from_mask",
+ "mask_from_occupancy",
+ "distance_map_from_occupancy",
+ "inflate_obstacles",
+]
