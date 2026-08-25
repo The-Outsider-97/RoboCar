@@ -7,9 +7,14 @@ Expected layout:
       src/
       logs/
 
-This entry point never starts vehicle motion by itself.  It initializes the
-hardware boundary at neutral, starts sensor ingestion, initializes the required
-SLAI Safety/Execution agents, and remains available for higher-level callers.
+This entry point never starts vehicle motion by itself. It initializes the
+hardware boundary at neutral, starts sensor ingestion, initializes the RoboCar
+SLAI integration, services the synchronous vehicle watchdog, publishes optional
+health summaries, and remains available for higher-level callers.
+
+The watchdog is intentionally serviced from this outer runtime loop rather than
+from a hidden background thread. A critical watchdog report therefore follows
+RoboCar's stop-first enforcement path before any recovery handling occurs.
 """
 
 from __future__ import annotations
@@ -23,6 +28,11 @@ import time
 from typing import Optional
 
 from RoboCar.robocar import RoboCar
+
+
+# Preserve the existing launcher cadence. This is a supervisory/service cadence,
+# not a claim that 50 ms is a calibrated motion-control deadline.
+_SERVICE_INTERVAL_S = 0.05
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -73,25 +83,43 @@ def main(argv: Optional[list[str]] = None) -> int:
             allow_simulation=args.simulate,
         )
         car.start()
-        print("RoboCar initialized at neutral. Press Ctrl+C to stop.")
+        print(
+            "RoboCar initialized at neutral; watchdog supervision active. "
+            "Press Ctrl+C to stop."
+        )
 
         interval = float(args.health_interval)
         next_health = time.monotonic()
+
         while not stopping:
-            if interval > 0.0 and time.monotonic() >= next_health:
+            # VehicleWatchdog is synchronous by design. Service it before
+            # diagnostics so a critical condition follows the enforcing
+            # stop/recovery path rather than being merely reported by health().
+            car.service()
+
+            now = time.monotonic()
+            if interval > 0.0 and now >= next_health:
                 print(json.dumps(car.health(), default=str, indent=2))
-                next_health = time.monotonic() + interval
-            time.sleep(0.05)
+                next_health = now + interval
+
+            time.sleep(_SERVICE_INTERVAL_S)
+
         return 0
     except Exception as exc:
-        print(f"RoboCar startup/runtime failure: {type(exc).__name__}: {exc}", file=sys.stderr)
+        print(
+            f"RoboCar startup/runtime failure: {type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )
         return 1
     finally:
         if car is not None:
             try:
                 car.close()
             except Exception as exc:
-                print(f"RoboCar shutdown failure: {type(exc).__name__}: {exc}", file=sys.stderr)
+                print(
+                    f"RoboCar shutdown failure: {type(exc).__name__}: {exc}",
+                    file=sys.stderr,
+                )
 
 
 if __name__ == "__main__":
