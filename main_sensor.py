@@ -1,39 +1,31 @@
-"""
-Reads Pico H serial, parses JSON/KEY:VALUE lines into SensorReading objects,
-and exposes:
-  - a non-blocking queue via poll_nowait()
-  - a latest() snapshot
-  - a subscribe(callback) stream
+"""Host-side Pico sensor gateway for RoboCar.
 
-Hardware map (Pico H on Grove Shield v1.0):
+The Pico is the deterministic sensor/IO side of the vehicle.  This module owns
+only the Raspberry-Pi-side serial transport and frame normalization.  It does
+not re-implement the Pico's I2C/GPIO sensor drivers.
 
-I2C0  (GP4 SDA, GP5 SCL)  -> MPU6050 IMU
-I2C1  (GP6 SDA, GP7 SCL)  -> Grove I2C Hub:
-                              - VL53L0X (GY-530)
-                              - TLV493D (3D magnetometer)
+Supported line protocols are the repository's existing formats:
 
-LEDs on Grove Shield digital ports (documented D16/D18/D20):
-  D16 -> GP16  : Front LED (white)
-  D18 -> GP18  : Rear LED  (red)
-  D20 -> GP20  : Link/Signal LED (yellow)
-See Seeed's Grove Shield docs/examples where D16 maps to Pin(16), etc.  # ref: wiki
+* one JSON object per line;
+* comma-separated ``KEY:VALUE`` pairs.
+
+Simulation is intentionally opt-in.  Missing pyserial, an unavailable Pico, or
+an open/read failure must not silently replace physical measurements with
+plausible synthetic values on a real vehicle.
 """
 
 from __future__ import annotations
 
-import json
+import queue
 import threading
 import time
-import queue
-import sys
 
-from dataclasses import dataclass
-from typing import Callable, Optional
+from dataclasses import asdict, dataclass
+from typing import Any, Callable, Optional
 
 from .utils.rc_errors import *
 from .utils.rc_helpers import *
-# from system.hardware.ssd1306 import SSD1306_I2C, SSD1306_SPI
-from logs.logger import get_logger, PrettyPrinter
+from logs.logger import get_logger, PrettyPrinter # pyright: ignore[reportMissingImports]
 
 logger = get_logger("SensorBus")
 printer = PrettyPrinter()
@@ -55,6 +47,7 @@ printer = PrettyPrinter()
 # nRF24 PA/LNA radio (SPI) pins are reserved here for reference only; this module is handled by
 # a different program. You can remap SPI to several GPIOs on RP2040; keep CE/CSN on free GPIOs.
 
+# === Pico H Pin Map (Grove Shield v1.0) ======================================
 # I2C0 bus (IMU)
 PICO_I2C0_SDA = 4
 PICO_I2C0_SCL = 5
@@ -90,275 +83,429 @@ I2C_ADDR = {
 
 # Structured map for programmatic use / export to JSON
 PICO_PINMAP = {
-    "i2c0": {"sda": PICO_I2C0_SDA, "scl": PICO_I2C0_SCL, "devices": ["MPU6050"]},
-    "i2c1": {"sda": PICO_I2C1_SDA, "scl": PICO_I2C1_SCL, "hub": True, "devices": ["VL53L0X","TLV493D"]},
+    "i2c0": {
+        "sda": PICO_I2C0_SDA,
+        "scl": PICO_I2C0_SCL,
+        "devices": ["MPU6050"],
+    },
+    "i2c1": {
+        "sda": PICO_I2C1_SDA,
+        "scl": PICO_I2C1_SCL,
+        "hub": True,
+        "devices": ["VL53L0X", "TLV493D"],
+    },
     "ultrasonic": {
-        "mode": "gpio",  # "gpio" for HC-SR04P via TRIG/ECHO; set to "i2c" if using an I2C ultrasonic ranger
-        "front": {"trig": PICO_US_FRONT_TRIG, "echo": PICO_US_FRONT_ECHO, "divider_top_ohm": 1800, "divider_bottom_ohm": 3300},
-        "rear":  {"trig": PICO_US_REAR_TRIG,  "echo": PICO_US_REAR_ECHO,  "divider_top_ohm": 1800, "divider_bottom_ohm": 3300}
+        "mode": "gpio",
+        "front": {
+            "trig": PICO_US_FRONT_TRIG,
+            "echo": PICO_US_FRONT_ECHO,
+            "divider_top_ohm": 1800,
+            "divider_bottom_ohm": 3300,
+        },
+        "rear": {
+            "trig": PICO_US_REAR_TRIG,
+            "echo": PICO_US_REAR_ECHO,
+            "divider_top_ohm": 1800,
+            "divider_bottom_ohm": 3300,
+        },
     },
     "hall": {"signal": PICO_HALL},
-    "led": {"front": PICO_LED_FRONT, "rear": PICO_LED_REAR, "signal": PICO_LED_SIGNAL},
+    "led": {
+        "front": PICO_LED_FRONT,
+        "rear": PICO_LED_REAR,
+        "signal": PICO_LED_SIGNAL,
+    },
     "i2c_addr": I2C_ADDR,
     "notes": {
-        "grove_shield_ports": {"D16": PICO_LED_FRONT, "D18": PICO_LED_REAR, "D20": PICO_LED_SIGNAL},
-        "power_warning": "Use pin 36 (3V3) for sensor power. Pin 37 is 3V3_EN (not a supply)."
-    }
+        "grove_shield_ports": {
+            "D16": PICO_LED_FRONT,
+            "D18": PICO_LED_REAR,
+            "D20": PICO_LED_SIGNAL,
+        },
+        "power_warning": (
+            "Use pin 36 (3V3) for sensor power. Pin 37 is 3V3_EN, not a supply."
+        ),
+    },
 }
 
+
 def pico_pinmap_json() -> str:
-    """JSON representation of the Pico pin map (for dashboards or to ship to FW)."""
-    try:
-        import json as _json
-        return _json.dumps(PICO_PINMAP, separators=(',', ':'), sort_keys=True)
-    except Exception:
-        # very limited environments may not have json module; fall back
-        return (
-            '{"i2c0":{"sda":%d,"scl":%d},"i2c1":{"sda":%d,"scl":%d}}'
-            % (PICO_I2C0_SDA, PICO_I2C0_SCL, PICO_I2C1_SDA, PICO_I2C1_SCL)
-        )
+    """Return the hardware map in deterministic JSON form."""
 
-# ============================================================================
+    import json
 
-@dataclass
+    return json.dumps(PICO_PINMAP, separators=(",", ":"), sort_keys=True)
+
+
+@dataclass(slots=True)
 class SensorReading:
-    t: float                                 # host timestamp
+    """One normalized host-side sensor frame.
+
+    ``t`` is the Raspberry Pi wall-clock receipt timestamp.  ``encoder_ticks_total``
+    is optional and is only populated if the Pico firmware sends an accumulated
+    tick counter; the digital ``hall`` level is retained separately and must not
+    be treated as a complete wheel-encoder count on the host.
+    """
+
+    t: float
     ultra_front_m: Optional[float] = None
     ultra_rear_m: Optional[float] = None
     tof_mm: Optional[int] = None
-    hall: Optional[int] = None               # digital level
-    imu_ax: Optional[float] = None           # m/s^2
+    hall: Optional[int] = None
+    encoder_ticks_total: Optional[int] = None
+    imu_ax: Optional[float] = None
     imu_ay: Optional[float] = None
     imu_az: Optional[float] = None
-    imu_gx: Optional[float] = None           # deg/s
+    imu_gx: Optional[float] = None
     imu_gy: Optional[float] = None
     imu_gz: Optional[float] = None
-    mag_x: Optional[float] = None            # mT (scaled)
+    mag_x: Optional[float] = None
     mag_y: Optional[float] = None
     mag_z: Optional[float] = None
-    led_front: Optional[int] = None          # 0/1
-    led_rear: Optional[int] = None           # 0/1
-    led_signal: Optional[int] = None         # 0/1
+    led_front: Optional[int] = None
+    led_rear: Optional[int] = None
+    led_signal: Optional[int] = None
     vbat: Optional[float] = None
 
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
 class SensorBus:
+    """Threaded serial gateway for Pico sensor frames.
+
+    Parameters
+    ----------
+    port:
+        Device path, or ``"auto"``/``None`` for USB serial autodetection.
+    baud:
+        Serial baud rate.
+    qmax:
+        Maximum number of frames kept for polling.  The newest frame always wins
+        when producers outrun consumers.
+    allow_simulation:
+        Explicit permission to synthesize frames when physical serial transport
+        cannot be started.  This defaults to ``False`` for fail-safe operation.
     """
-    Host-side gateway for the serial stream coming from the Pico.
 
-    The Pico firmware can send either:
-      - JSON objects per line, e.g.
-        {"ultra_front_m":1.23, "ultra_rear_m":0.88, "tof_mm":557, "hall":1, "imu_ax":0.1, ...}
-      - or comma-separated KEY:VALUE pairs, e.g.
-        ULTRA_FRONT:1.23, ULTRA_REAR:0.88, TOF:557, HALL:1, IMU_AX:0.1
-
-    This class:
-      * buffers the stream in a non-blocking queue,
-      * keeps a "latest()" snapshot,
-      * lets you subscribe(callback) for push updates,
-      * simulates data if no serial device is found (useful on dev laptops).
-    """
-
-    def __init__(self, port: Optional[str] = "auto", baud: int = 115200, qmax: int = 64):
+    def __init__(
+        self,
+        port: Optional[str] = "auto",
+        baud: int = 115200,
+        qmax: int = 64,
+        *,
+        allow_simulation: bool = False,
+    ) -> None:
         self.port = port
-        self.baud = baud
-        self._ser = None
+        self.baud = require_int(baud, "sensor_bus.baud", minimum=1)
+        queue_size = require_int(qmax, "sensor_bus.qmax", minimum=1)
+        self.allow_simulation = bool(allow_simulation)
+
+        self._ser: Any = None
         self._thread: Optional[threading.Thread] = None
         self._stop = threading.Event()
-        self._q: "queue.Queue[SensorReading]" = queue.Queue(maxsize=qmax)
+        self._q: "queue.Queue[SensorReading]" = queue.Queue(maxsize=queue_size)
         self._latest: Optional[SensorReading] = None
         self._simulation = False
         self._subscribers: list[Callable[[SensorReading], None]] = []
+        self._subscriber_lock = threading.RLock()
 
-    # ---- public API ---------------------------------------------------------
+        self._status = "stopped"
+        self._resolved_port: Optional[str] = None
+        self._last_error: Optional[str] = None
+        self._frames_received = 0
+        self._parse_errors = 0
+        self._transport_errors = 0
+        self._callback_errors = 0
+        self._dropped_frames = 0
+        self._last_frame_monotonic: Optional[float] = None
 
-    def start(self):
-        """Begin reading serial (or simulation if no port found)."""
-        if self._thread and self._thread.is_alive():
+    @property
+    def is_simulation(self) -> bool:
+        return self._simulation
+
+    @property
+    def running(self) -> bool:
+        return bool(self._thread and self._thread.is_alive())
+
+    def start(self) -> None:
+        """Start physical serial acquisition or explicit simulation."""
+
+        if self.running:
             return
-        try:
-            import serial  # pyserial
-        except Exception:
-            serial = None
-
-        if serial is None:
-            # pyserial not installed -> simulation
-            self._start_sim()
-            return
-        try:
-            resolved = None
-            if self.port in (None, "auto"):
-                resolved = self._autodetect_port()
-            else:
-                resolved = self.port
-            if not resolved:
-                # no ports found -> simulation
-                self._start_sim()
-                return
-            self._ser = serial.Serial(
-                resolved, self.baud, timeout=1)
-            self._stop.clear()
-            self._thread = threading.Thread(target=self._loop, daemon=True)
-            self._thread.start()
-        except Exception:
-            # open failed -> simulation
-            self._start_sim()
-
-    def _start_sim(self):
-        self._simulation = True
         self._stop.clear()
-        self._thread = threading.Thread(target=self._sim_loop, daemon=True)
-        self._thread.start()
-    
-    def _sim_loop(self):
-        ticks = 0
-        while not self._stop.is_set():
-            ticks += 1
-            # make up some plausible values
-            r = SensorReading(
-                t=time.time(),
-                ultra_front_m=0.35 + 0.05 * (1 if (ticks // 25) % 2 == 0 else -1),
-                ultra_rear_m=0.50 + 0.07 * (1 if (ticks // 30) % 2 == 0 else -1),
-                tof_mm=600 + (ticks % 40),
-                hall=1 if (ticks // 10) % 2 == 0 else 0,
-                imu_ax=0.01, imu_ay=-0.02, imu_az=9.78,
-                imu_gx=0.1, imu_gy=0.2, imu_gz=0.3,
-                mag_x=0.5, mag_y=0.0, mag_z=-0.2,
-                led_front=(ticks // 20) % 2,
-                led_rear=(ticks // 30) % 2,
-                led_signal=(ticks // 10) % 2,
-            )
-            self._publish(r)
-            time.sleep(0.05)
+        self._simulation = False
+        self._last_error = None
 
-    def stop(self):
-        self._stop.set()
-        if self._thread:
-            self._thread.join(timeout=1.0)
-        self._thread = None
         try:
-            if self._ser:
-                self._ser.close()
-        except Exception:
-            pass
-        self._ser = None
+            import serial  # type: ignore
+        except Exception as exc:
+            self._start_simulation_or_raise("pyserial_unavailable", exc)
+            return
 
-    def subscribe(self, callback: Callable[[SensorReading], None]):
-        """Call callback(reading) for each parsed frame."""
-        self._subscribers.append(callback)
+        resolved = self._autodetect_port() if self.port in (None, "auto") else self.port
+        if not resolved:
+            self._start_simulation_or_raise("serial_port_not_found")
+            return
+
+        try:
+            self._ser = serial.Serial(resolved, self.baud, timeout=1)
+        except Exception as exc:
+            self._start_simulation_or_raise("serial_open_failed", exc)
+            return
+
+        self._resolved_port = str(resolved)
+        self._status = "operational"
+        self._thread = threading.Thread(
+            target=self._loop,
+            name="RoboCarSensorBus",
+            daemon=True,
+        )
+        self._thread.start()
+        logger.info("SensorBus started on %s at %s baud", resolved, self.baud)
+
+    def stop(self) -> None:
+        """Stop acquisition and close the serial device."""
+
+        self._stop.set()
+        thread = self._thread
+        if thread and thread is not threading.current_thread():
+            thread.join(timeout=1.5)
+        self._thread = None
+        if self._ser is not None:
+            try:
+                self._ser.close()
+            except Exception as exc:
+                logger.warning("SensorBus serial close failed: %s", exc)
+        self._ser = None
+        self._status = "stopped"
+
+    close = stop
+
+    def subscribe(self, callback: Callable[[SensorReading], None]) -> Callable[[SensorReading], None]:
+        """Register a push callback and return it for convenient unsubscription."""
+
+        if not callable(callback):
+            raise TypeError("callback must be callable")
+        with self._subscriber_lock:
+            if callback not in self._subscribers:
+                self._subscribers.append(callback)
+        return callback
+
+    def unsubscribe(self, callback: Callable[[SensorReading], None]) -> bool:
+        with self._subscriber_lock:
+            try:
+                self._subscribers.remove(callback)
+                return True
+            except ValueError:
+                return False
 
     def latest(self) -> Optional[SensorReading]:
-        """Return latest parsed frame (if any)."""
         return self._latest
 
     def poll_nowait(self) -> Optional[SensorReading]:
-        """Pop one reading from the queue, if available (non-blocking)."""
         try:
             return self._q.get_nowait()
         except queue.Empty:
             return None
 
-    # ---- internal -----------------------------------------------------------
+    def health(self) -> dict[str, Any]:
+        age = None
+        if self._last_frame_monotonic is not None:
+            age = max(0.0, time.monotonic() - self._last_frame_monotonic)
+        return {
+            "status": self._status,
+            "running": self.running,
+            "mode": "simulation" if self._simulation else "hardware",
+            "simulation_allowed": self.allow_simulation,
+            "port_requested": self.port,
+            "port_resolved": self._resolved_port,
+            "baud": self.baud,
+            "frames_received": self._frames_received,
+            "parse_errors": self._parse_errors,
+            "transport_errors": self._transport_errors,
+            "callback_errors": self._callback_errors,
+            "dropped_frames": self._dropped_frames,
+            "last_frame_age_s": age,
+            "last_error": self._last_error,
+        }
 
-    def _publish(self, r: SensorReading):
-        self._latest = r
-        for cb in self._subscribers:
-            try:
-                cb(r)
-            except Exception:
-                pass
-        try:
-            self._q.put_nowait(r)
-        except queue.Full:
-            # drop oldest to make room
-            try:
-                _ = self._q.get_nowait()
-            except queue.Empty:
-                pass
-            self._q.put_nowait(r)
+    # ------------------------------------------------------------------
+    # Internal transport
+    # ------------------------------------------------------------------
+    def _start_simulation_or_raise(
+        self,
+        reason: str,
+        cause: Optional[BaseException] = None,
+    ) -> None:
+        details = reason if cause is None else f"{reason}: {type(cause).__name__}: {cause}"
+        self._last_error = details
+        if not self.allow_simulation:
+            self._status = "failed"
+            logger.error("SensorBus cannot start physical transport: %s", details)
+            raise CommunicationError("RaspberryPi", "Pico", reason) from cause
+
+        logger.warning("SensorBus entering explicit simulation mode: %s", details)
+        self._simulation = True
+        self._status = "simulation"
+        self._resolved_port = None
+        self._thread = threading.Thread(
+            target=self._sim_loop,
+            name="RoboCarSensorSimulation",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def _sim_loop(self) -> None:
+        ticks = 0
+        while not self._stop.is_set():
+            ticks += 1
+            reading = SensorReading(
+                t=time.time(),
+                ultra_front_m=0.35 + 0.05 * (1 if (ticks // 25) % 2 == 0 else -1),
+                ultra_rear_m=0.50 + 0.07 * (1 if (ticks // 30) % 2 == 0 else -1),
+                tof_mm=600 + (ticks % 40),
+                hall=1 if (ticks // 10) % 2 == 0 else 0,
+                encoder_ticks_total=ticks,
+                imu_ax=0.01,
+                imu_ay=-0.02,
+                imu_az=9.78,
+                imu_gx=0.1,
+                imu_gy=0.2,
+                imu_gz=0.3,
+                mag_x=0.5,
+                mag_y=0.0,
+                mag_z=-0.2,
+                led_front=(ticks // 20) % 2,
+                led_rear=(ticks // 30) % 2,
+                led_signal=(ticks // 10) % 2,
+                vbat=None,
+            )
+            self._publish(reading)
+            self._stop.wait(0.05)
 
     def _autodetect_port(self) -> Optional[str]:
         try:
-            from serial.tools import list_ports
-        except Exception:
+            from serial.tools import list_ports  # type: ignore
+        except Exception as exc:
+            self._last_error = f"serial_port_enumeration_failed: {exc}"
             return None
-        candidates = []
-        for p in list_ports.comports():
-            # heuristic: look for Pico or USB serial adapters
-            name = f"{p.device} {p.description} {p.hwid}".lower()
-            if "pico" in name or "usb serial" in name or "ch340" in name or "cp210" in name:
-                candidates.append(p.device)
+
+        candidates: list[str] = []
+        for port in list_ports.comports():
+            name = f"{port.device} {port.description} {port.hwid}".lower()
+            if any(token in name for token in ("pico", "usb serial", "ch340", "cp210")):
+                candidates.append(str(port.device))
         return candidates[0] if candidates else None
 
-    def _loop(self):
-        assert self._ser is not None
-        ser = self._ser
+    def _loop(self) -> None:
+        serial_device = self._ser
+        if serial_device is None:
+            self._status = "failed"
+            return
+
+        consecutive_transport_errors = 0
         while not self._stop.is_set():
             try:
-                line = ser.readline().decode("utf-8", errors="ignore").strip()
+                raw = serial_device.readline()
+                if not raw:
+                    continue
+                if isinstance(raw, bytes):
+                    line = raw.decode("utf-8", errors="strict").strip()
+                else:
+                    line = str(raw).strip()
                 if not line:
                     continue
-                r = self._parse_line(line)
-                if r:
-                    self._publish(r)
-            except Exception:
-                time.sleep(0.02)
+
+                reading = self._parse_line(line)
+                if reading is None:
+                    self._parse_errors += 1
+                    self._last_error = "unrecognized_or_invalid_sensor_frame"
+                    logger.debug("Dropped unrecognized Pico frame: %r", line[:240])
+                    continue
+
+                consecutive_transport_errors = 0
+                self._status = "operational"
+                self._publish(reading)
+            except UnicodeDecodeError as exc:
+                self._parse_errors += 1
+                self._last_error = f"serial_decode_error: {exc}"
+                logger.warning("SensorBus dropped non-UTF8 serial frame: %s", exc)
+            except Exception as exc:
+                consecutive_transport_errors += 1
+                self._transport_errors += 1
+                self._last_error = f"serial_read_error: {type(exc).__name__}: {exc}"
+                self._status = "degraded"
+                logger.error("SensorBus serial read failed: %s", exc)
+                # Do not silently convert a live hardware failure into simulation.
+                self._stop.wait(min(0.25, 0.02 * consecutive_transport_errors))
+
+    def _publish(self, reading: SensorReading) -> None:
+        self._latest = reading
+        self._frames_received += 1
+        self._last_frame_monotonic = time.monotonic()
+
+        with self._subscriber_lock:
+            subscribers = tuple(self._subscribers)
+        for callback in subscribers:
+            try:
+                callback(reading)
+            except Exception as exc:
+                self._callback_errors += 1
+                self._last_error = f"subscriber_error: {type(exc).__name__}: {exc}"
+                logger.exception("SensorBus subscriber failed")
+
+        if bounded_queue_put(self._q, reading):
+            self._dropped_frames += 1
 
     @staticmethod
     def _parse_line(line: str) -> Optional[SensorReading]:
-        # JSON first
-        try:
-            obj = json.loads(line)
-            return SensorReading(
-                t=time.time(),
-                ultra_front_m=_to_float(obj.get("ultra_front_m")),
-                ultra_rear_m=_to_float(obj.get("ultra_rear_m")),
-                tof_mm=_to_int(obj.get("tof_mm")),
-                hall=_to_int(obj.get("hall")),
-                imu_ax=_to_float(obj.get("imu_ax")),
-                imu_ay=_to_float(obj.get("imu_ay")),
-                imu_az=_to_float(obj.get("imu_az")),
-                imu_gx=_to_float(obj.get("imu_gx")),
-                imu_gy=_to_float(obj.get("imu_gy")),
-                imu_gz=_to_float(obj.get("imu_gz")),
-                mag_x=_to_float(obj.get("mag_x")),
-                mag_y=_to_float(obj.get("mag_y")),
-                mag_z=_to_float(obj.get("mag_z")),
-                led_front=_to_int(obj.get("led_front")),
-                led_rear=_to_int(obj.get("led_rear")),
-                led_signal=_to_int(obj.get("led_signal")),
-                vbat=_to_float(obj.get("vbat")),
-            )
-        except Exception:
-            pass
-        # KEY:VALUE fallback (comma-separated)
-        kv = {}
-        for part in line.split(","):
-            part = part.strip()
-            if ":" in part:
-                k, v = part.split(":", 1)
-                kv[k.strip().upper()] = v.strip()
-        if kv:
-            return SensorReading(
-                ultra_front_m=_to_float(kv.get("ULTRA_FRONT")),
-                ultra_rear_m=_to_float(kv.get("ULTRA_REAR")),
-                tof_mm=_to_int(kv.get("TOF")),
-                hall=_to_int(kv.get("HALL")),
-                imu_ax=_to_float(kv.get("IMU_AX")),
-                imu_ay=_to_float(kv.get("IMU_AY")),
-                imu_az=_to_float(kv.get("IMU_AZ")),
-                imu_gx=_to_float(kv.get("IMU_GX")),
-                imu_gy=_to_float(kv.get("IMU_GY")),
-                imu_gz=_to_float(kv.get("IMU_GZ")),
-                mag_x=_to_float(kv.get("MAG_X")),
-                mag_y=_to_float(kv.get("MAG_Y")),
-                mag_z=_to_float(kv.get("MAG_Z")),
-                led_front=_to_int(kv.get("LED_FRONT")),
-                led_rear=_to_int(kv.get("LED_REAR")),
-                led_signal=_to_int(kv.get("LED_SIGNAL")),
-                vbat=_to_float(kv.get("VBAT")),
-                t=time.time(),
-            )
-        return None
+        payload = decode_serial_payload(line)
+        if not payload:
+            return None
+
+        def get(*names: str) -> Any:
+            return get_case_insensitive(payload, *names)
+
+        # Physical measurements are finite and non-negative where appropriate.
+        # Invalid individual values become None; the rest of a valid frame is
+        # retained so one sensor cannot erase all other observations.
+        reading = SensorReading(
+            t=time.time(),
+            ultra_front_m=optional_finite_float(
+                get("ultra_front_m", "ULTRA_FRONT"), minimum=0.0
+            ),
+            ultra_rear_m=optional_finite_float(
+                get("ultra_rear_m", "ULTRA_REAR"), minimum=0.0
+            ),
+            tof_mm=optional_int(get("tof_mm", "TOF"), minimum=0),
+            hall=optional_binary(get("hall", "HALL")),
+            encoder_ticks_total=optional_int(
+                get("encoder_ticks_total", "ENCODER_TICKS", "TICKS_TOTAL"),
+                minimum=0,
+            ),
+            imu_ax=optional_finite_float(get("imu_ax", "IMU_AX")),
+            imu_ay=optional_finite_float(get("imu_ay", "IMU_AY")),
+            imu_az=optional_finite_float(get("imu_az", "IMU_AZ")),
+            imu_gx=optional_finite_float(get("imu_gx", "IMU_GX")),
+            imu_gy=optional_finite_float(get("imu_gy", "IMU_GY")),
+            imu_gz=optional_finite_float(get("imu_gz", "IMU_GZ")),
+            mag_x=optional_finite_float(get("mag_x", "MAG_X")),
+            mag_y=optional_finite_float(get("mag_y", "MAG_Y")),
+            mag_z=optional_finite_float(get("mag_z", "MAG_Z")),
+            led_front=optional_binary(get("led_front", "LED_FRONT")),
+            led_rear=optional_binary(get("led_rear", "LED_REAR")),
+            led_signal=optional_binary(get("led_signal", "LED_SIGNAL")),
+            vbat=optional_finite_float(get("vbat", "VBAT"), minimum=0.0),
+        )
+        payload_values = reading.to_dict()
+        if not any(
+            value is not None
+            for key, value in payload_values.items()
+            if key != "t"
+        ):
+            return None
+        return reading
 
 
 __all__ = [
@@ -382,7 +529,6 @@ __all__ = [
 ]
 
 
-# === quick smoke test =========================================================
 if __name__ == "__main__":
     print("\n=== Running Sensor Bus ===\n")
     printer.status("TEST", "Initializing SensorBus", "info")
