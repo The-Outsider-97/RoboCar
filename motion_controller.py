@@ -5,6 +5,7 @@ from typing import Any, Dict
 
 from .utils.config_loader import load_global_config, get_config_section
 from .utils.rc_error import *
+from .utils.rc_helpers import *
 from .hardware.PCA9685 import PCA9685
 from logs.logger import get_logger, PrettyPrinter # pyright: ignore[reportMissingImports]
 
