@@ -10,10 +10,10 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
-from .edt2d import distance_map_from_occupancy, inflate_obstacles
 from .motion_controller import MotionController, PIDSpeedController
 from .wheel_encoder import WheelEncoder
 from .main_sensor import SensorBus, SensorReading
+from .modules.edt2d import distance_map_from_occupancy, inflate_obstacles
 from .utils.config_loader import load_global_config, get_config_section
 from .utils.rc_errors import *
 from .utils.rc_helpers import *
