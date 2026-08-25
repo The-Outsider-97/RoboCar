@@ -3,7 +3,8 @@ import math
 import time
 
 from .utils.config_loader import load_global_config, get_config_section
-from .utils.error_handler import ConfigurationError, SensorError
+from .utils.rc_errors import *
+from .utils.rc_helpers import *
 from logs.logger import get_logger, PrettyPrinter # pyright: ignore[reportMissingImports]
 
 logger = get_logger("RC Wheel Encoder")
