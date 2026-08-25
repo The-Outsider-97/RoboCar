@@ -1,1 +1,72 @@
+main: {}
 
+encoder:
+  ppr: 20
+  wheel_d: 0.065
+  gear_ratio: 1.0
+  alpha: 0.4
+
+motion:
+  pwm_freq_hz: 50
+  steer_channel: 0
+  throttle_channel: 1
+  esc_min_us: 1000
+  esc_max_us: 2000
+  esc_neutral_us: 1500
+  servo_min_us: 1000
+  servo_max_us: 2000
+  servo_center_us: 1500
+  servo_max_angle_rad: 0.6
+
+speed:
+  kp: 1.2
+  ki: 0.4
+  kd: 0.05
+  u_min: -1.0
+  u_max: 1.0
+
+hardware:
+  pwm_driver: "PCA9685"
+  pwm_freq_hz: 50
+  steer_channel: 0
+  throttle_channel: 1
+  esc_type: "Hobbywing_Quicrun_1060"
+  esc_min_us: 1000
+  esc_max_us: 2000
+  esc_neutral_us: 1500
+  servo_min_us: 1000
+  servo_max_us: 2000
+  servo_center_us: 1500
+  servo_max_angle_rad: 0.6
+  lidar:
+    model: "YDLIDAR_X4Pro"
+    port: "/dev/ttyUSB0"
+    baud: 128000
+  camera:
+    model: "OV5647"
+    resolution: [1280,720]
+    fps: 30
+    libcamera: true
+  encoder:
+    source: "ticks_shared_memory_or_serial"
+    pulses_per_rev: 20
+    wheel_diameter_m: 0.065
+    gear_ratio: 1.0
+  pico_serial:
+    port: "/dev/ttyACM0"
+    baud: 115200
+  e_stop_gpio:
+    pin: 23
+    active_low: true
+
+power:
+  v_warn: 7.4
+  v_cutback: 7.0
+  v_critical: 6.6
+
+robocar:
+  lookahead: 0.5
+  wheelbase: 0.22
+  cache_ttl_s: 900
+  inflation_radius_m: 0.25
+  mem_file: "robot_memory.pkl"
