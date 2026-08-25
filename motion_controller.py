@@ -4,7 +4,7 @@ import time
 from typing import Any, Dict
 
 from .utils.config_loader import load_global_config, get_config_section
-from .utils.error_handler import ConfigurationError, HardwareError, ControlError
+from .utils.rc_error import *
 from .hardware.PCA9685 import PCA9685
 from logs.logger import get_logger, PrettyPrinter # pyright: ignore[reportMissingImports]
 
