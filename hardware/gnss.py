@@ -337,8 +337,9 @@ class L76KNMEAParser:
         if track is not None:
             s.track_deg = track
         s.utc_date = _rmc_date(_f(x, 8)) or s.utc_date
-        if _f(x, 11):
-            s.mode = _f(x, 11).upper()
+        mode = _f(x, 11)
+        if mode:
+            s.mode = mode.upper()
             if _mode_valid(s.mode) is False:
                 s.status_valid = False
 
@@ -362,8 +363,10 @@ class L76KNMEAParser:
         s = self._state
         s.utc_time = _utc_time(_f(x, 0)) or s.utc_time
         self._position(_f(x, 1), _f(x, 2), _f(x, 3), _f(x, 4))
-        if _f(x, 5):
-            s.mode = _f(x, 5).upper()
+        mode = _f(x, 5)
+        if mode:
+            mode = mode.upper()
+            s.mode = mode
             valid = _mode_valid(s.mode)
             if valid is not None:
                 s.status_valid = valid
@@ -383,8 +386,9 @@ class L76KNMEAParser:
         status = (_f(x, 5) or "").upper()
         if status in {"A", "V"}:
             s.status_valid = status == "A"
-        if _f(x, 6):
-            s.mode = _f(x, 6).upper()
+        mode = _f(x, 6)
+        if mode:
+            s.mode = mode.upper()
 
     def _apply_gsa(self, x):
         s = self._state
@@ -409,8 +413,9 @@ class L76KNMEAParser:
             s.speed_mps = kph * KPH_TO_MPS
         elif knots is not None:
             s.speed_mps = knots * KNOT_TO_MPS
-        if _f(x, 8):
-            s.mode = _f(x, 8).upper()
+        mode = _f(x, 8)
+        if mode is not None:
+            s.mode = mode.upper()
 
     def _apply_zda(self, x):
         s = self._state

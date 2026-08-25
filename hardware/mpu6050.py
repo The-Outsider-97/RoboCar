@@ -9,8 +9,25 @@ https://github.com/m-rtijn/mpu6050
 """
 
 import math
+import platform
 import time
-import smbus
+
+if platform.system() == 'Windows':
+    # Mock implementation for Windows
+    class SMBusMock:
+        def __init__(self, bus):
+            self.bus = bus
+        def write_byte_data(self, addr, reg, val):
+            pass
+        def read_byte_data(self, addr, reg):
+            return 0x68  # WHO_AM_I response
+        def read_i2c_block_data(self, addr, reg, length):
+            return [0] * length
+        # Add any other methods you use
+
+    smbus = type('smbus', (), {'SMBus': SMBusMock})()
+else:
+    import smbus2 as smbus # type: ignore
 
 from collections import deque
 
@@ -77,7 +94,7 @@ class mpu6050:
 
     def __init__(self, address, bus=1):
         self.address = address
-        self.bus = smbus.SMBus(bus)
+        self.bus = smbus.SMBus(bus) # type: ignore
         # Wake up the MPU-6050 since it starts in sleep mode
         self.bus.write_byte_data(self.address, self.PWR_MGMT_1, 0x00)
 
@@ -93,6 +110,7 @@ class mpu6050:
                 raise IOError("MPU6050 not found at address 0x{:02X}".format(self.address))
             
             # Wake up the MPU-6050 since it starts in sleep mode
+            assert self.bus is not None
             self.bus.write_byte_data(self.address, self.PWR_MGMT_1, 0x00)
             time.sleep(0.1)
             
@@ -114,12 +132,14 @@ class mpu6050:
             raise ValueError("Sample rate must be between 4 and 1000 Hz")
 
         div = int(1000 / rate - 1)  # Assuming 1kHz gyro output rate
+        assert self.bus is not None
         self.bus.write_byte_data(self.address, 0x19, div)
 
     def test_connection(self):
         """Test if the device is connected and responding"""
         try:
             # Read WHO_AM_I register (should return 0x68 or 0x71 for MPU6050)
+            assert self.bus is not None
             who_am_i = self.bus.read_byte_data(self.address, self.WHO_AM_I)
             return who_am_i in [0x68, 0x71]  # Some MPU6050 clones return 0x71
         except IOError:
@@ -134,6 +154,7 @@ class mpu6050:
         """
         try:
             # Read the data from the registers
+            assert self.bus is not None
             high = self.bus.read_byte_data(self.address, register)
             low = self.bus.read_byte_data(self.address, register + 1)
 
@@ -151,6 +172,7 @@ class mpu6050:
     def enable_sensors(self):
         """Ensure all sensors are enabled with proper settings"""
         # Wake up the device and ensure all sensors are enabled
+        assert self.bus is not None
         self.bus.write_byte_data(self.address, self.PWR_MGMT_1, 0x00)
         
         # Enable accelerometer and gyroscope
@@ -192,6 +214,7 @@ class mpu6050:
         pre-defined range is advised.
         """
         # First change it to 0x00 to make sure we write the correct value later
+        assert self.bus is not None
         self.bus.write_byte_data(self.address, self.ACCEL_CONFIG, 0x00)
 
         # Write the new range to the ACCEL_CONFIG register
@@ -200,6 +223,7 @@ class mpu6050:
     def set_gyro_range(self, gyro_range):
         """Sets the range of the gyroscope to range"""
         # First change it to 0x00 to make sure we write the correct value later
+        assert self.bus is not None
         self.bus.write_byte_data(self.address, self.GYRO_CONFIG, 0x00)
         # Write the new range to the GYRO_CONFIG register
         self.bus.write_byte_data(self.address, self.GYRO_CONFIG, gyro_range)
@@ -212,6 +236,7 @@ class mpu6050:
         If raw is False, it will return an integer: -1, 2, 4, 8 or 16. When it
         returns -1 something went wrong.
         """
+        assert self.bus is not None
         raw_data = self.bus.read_byte_data(self.address, self.ACCEL_CONFIG)
 
         if raw is True:
@@ -271,22 +296,33 @@ class mpu6050:
         print("Calibrating accelerometer... keep sensor level")
         x_offset, y_offset, z_offset = 0, 0, 0
         
+        valid_samples = 0
         for _ in range(samples):
             data = self.get_accel_data(g=True)  # Get data in g units
+            if data is None:
+                continue
+
             x_offset += data['x']
             y_offset += data['y']
             z_offset += data['z'] - 1.0  # Z should be 1g when level
+            valid_samples += 1
+
+        if valid_samples == 0:
+            raise RuntimeError("Unable to read accelerometer data during calibration")
         
         self.accel_offset = {
-            'x': x_offset / samples,
-            'y': y_offset / samples,
-            'z': z_offset / samples
+            'x': x_offset / valid_samples,
+            'y': y_offset / valid_samples,
+            'z': z_offset / valid_samples
         }
         print(f"Accel offsets: {self.accel_offset}")
     
     def get_calibrated_accel_data(self, g=False):
         """Return accelerometer data with offset compensation"""
         raw_data = self.get_accel_data(g=g)
+        if raw_data is None:
+            return None
+
         if g:
             # For g units, subtract the offset directly
             return {
@@ -332,6 +368,7 @@ class mpu6050:
     def set_filter_range(self, filter_range=FILTER_BW_256):
         """Sets the low-pass bandpass filter frequency"""
         # Keep the current EXT_SYNC_SET configuration in bits 3, 4, 5 in the MPU_CONFIG register
+        assert self.bus is not None
         EXT_SYNC_SET = self.bus.read_byte_data(self.address, self.MPU_CONFIG) & 0b00111000
         return self.bus.write_byte_data(self.address, self.MPU_CONFIG,  EXT_SYNC_SET | filter_range)
 
@@ -344,6 +381,7 @@ class mpu6050:
         If raw is False, it will return 250, 500, 1000, 2000 or -1. If the
         returned value is equal to -1 something went wrong.
         """
+        assert self.bus is not None
         raw_data = self.bus.read_byte_data(self.address, self.GYRO_CONFIG)
 
         if raw is True:
@@ -441,6 +479,7 @@ class mpu6050:
         """Read all sensor data in a single I2C transaction"""
         try:
             # Read 14 bytes starting from ACCEL_XOUT0
+            assert self.bus is not None
             data = self.bus.read_i2c_block_data(self.address, self.ACCEL_XOUT0, 14)
 
             # Convert data to signed values
@@ -487,6 +526,7 @@ class mpu6050:
         if accel:
             fifo_en |= 0x08  # ACCEL_FIFO_EN
             
+        assert self.bus is not None
         self.bus.write_byte_data(self.address, self.FIFO_EN, fifo_en)
         
         # Enable FIFO
@@ -495,6 +535,7 @@ class mpu6050:
     def get_fifo_count(self):
         """Get number of bytes in FIFO buffer"""
         try:
+            assert self.bus is not None
             high = self.bus.read_byte_data(self.address, self.FIFO_COUNT)
             low = self.bus.read_byte_data(self.address, self.FIFO_COUNT + 1)
             return (high << 8) + low
@@ -504,6 +545,7 @@ class mpu6050:
     def read_fifo_data(self, count):
         """Read data from FIFO buffer"""
         try:
+            assert self.bus is not None
             return self.bus.read_i2c_block_data(self.address, self.FIFO_R_W, count)
         except IOError as e:
             print(f"Error reading FIFO data: {e}")
@@ -545,6 +587,7 @@ class mpu6050:
     def reset_fifo(self):
         """Reset the FIFO buffer"""
         # Reset FIFO and I2C Master
+        assert self.bus is not None
         self.bus.write_byte_data(self.address, 0x6A, 0x04)
         # Enable FIFO
         self.bus.write_byte_data(self.address, 0x6A, 0x40)
