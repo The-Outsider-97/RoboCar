@@ -16,3 +16,10 @@ AI RC car
    cd RoboCar
    ```
 
+# Copy this code under SLAI/rc_main.py
+
+## rc_main.py
+
+```python
+
+```
