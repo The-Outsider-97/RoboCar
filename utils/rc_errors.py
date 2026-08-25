@@ -262,6 +262,23 @@ class ConfigurationError(RoboCarError):
             remediation="Validate configuration files and parameters"
         )
 
+
+class GNSSError(RuntimeError):
+    pass
+
+
+class GNSSProtocolError(GNSSError):
+    pass
+
+
+class GNSSTransportError(GNSSError):
+    pass
+
+
+class GNSSConfigurationError(GNSSError):
+    pass
+
+
 __all__ = [
     "RoboCarErrorType",
     "RoboCarError",
@@ -277,4 +294,8 @@ __all__ = [
     "PowerError",
     "CommunicationError",
     "ConfigurationError",
+    "GNSSError",
+    "GNSSProtocolError",
+    "GNSSTransportError",
+    "GNSSConfigurationError",
 ]
