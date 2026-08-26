@@ -5,8 +5,25 @@ Based on the Seeed Studio Arduino library
 Adapted for Raspberry Pi with smbus2
 """
 
+import platform
 import time
-from smbus2 import SMBus
+
+if platform.system() == 'Windows':
+    # Mock implementation for Windows
+    class SMBusMock:
+        def __init__(self, bus):
+            self.bus = bus
+        def write_byte_data(self, addr, reg, val):
+            pass
+        def read_byte_data(self, addr, reg):
+            return 0x68  # WHO_AM_I response
+        def read_i2c_block_data(self, addr, reg, length):
+            return [0] * length
+        # Add any other methods you use
+
+    smbus = type('smbus', (), {'SMBus': SMBusMock})()
+else:
+    from smbus2 import SMBus # type: ignore
 
 class MCP9808:
     # Register addresses
@@ -33,7 +50,7 @@ class MCP9808:
         :param i2c_bus: I2C bus number (default: 1 for Raspberry Pi)
         """
         self._iic_addr = i2c_addr
-        self.bus = SMBus(i2c_bus)
+        self.bus = smbus.SMBus(i2c_bus) # type: ignore
     
     def set_config(self, cfg):
         """
@@ -157,6 +174,11 @@ class MCP9808:
         # Read two bytes
         data = self.bus.read_i2c_block_data(self._iic_addr, reg, 2)
         return (data[0] << 8) | data[1]
+
+
+__all__ = [
+    "MCP9808",
+]
 
 
 # Example usage

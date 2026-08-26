@@ -228,3 +228,8 @@ class UltrasonicSensor:
             # Reduce sampling rate and disable filtering when in power save
             self.num_samples = 3
             self.filter_enabled = False
+
+
+__all__ = [
+    "UltrasonicSensor",
+]

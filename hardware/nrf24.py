@@ -1,14 +1,15 @@
-import pigpio
+import pigpio # type: ignore
+import time
+
 from enum import Enum, IntEnum
 from os import environ as env
-import time
 
 
 class RF24_PA(IntEnum):
-    MIN = 0,
-    LOW = 1,
-    HIGH = 2,
-    MAX = 3,
+    MIN = 0
+    LOW = 1
+    HIGH = 2
+    MAX = 3
     ERROR = 4
 
     @staticmethod
@@ -36,8 +37,8 @@ class RF24_PA(IntEnum):
 
 
 class RF24_DATA_RATE(IntEnum):
-    RATE_1MBPS = 0,
-    RATE_2MBPS = 1,
+    RATE_1MBPS = 0
+    RATE_2MBPS = 1
     RATE_250KBPS = 2
 
     @staticmethod
@@ -65,8 +66,8 @@ class RF24_DATA_RATE(IntEnum):
 
 
 class RF24_CRC(IntEnum):
-    DISABLED = 0,
-    BYTES_1 = 1,
+    DISABLED = 0
+    BYTES_1 = 1
     BYTES_2 = 2
 
     @staticmethod
@@ -160,11 +161,11 @@ class SPI_CHANNEL(IntEnum):
     
 
 class RF24_RX_ADDR(IntEnum):
-    P0 = 0x0a,
-    P1 = 0x0b,
-    P2 = 0x0c,
-    P3 = 0x0d,
-    P4 = 0x0e,
+    P0 = 0x0a
+    P1 = 0x0b
+    P2 = 0x0c
+    P3 = 0x0d
+    P4 = 0x0e
     P5 = 0x0f
 
 
@@ -1273,3 +1274,68 @@ class NRF24:
             s += "W_TX_PAYLOAD_NOACK off"
 
         return s
+
+
+__all__ = [
+    "RF24_PA",
+    "RF24_DATA_RATE",
+    "RF24_CRC",
+    "RF24_PAYLOAD",
+    "SPI_CHANNEL",
+    "RF24_RX_ADDR",
+    "NRF24",
+]
+
+if __name__ == "__main__":
+    import sys
+
+    # Default parameters
+    CE_PIN = 22
+    SPI_CH = SPI_CHANNEL.MAIN_CE0  # main SPI CE0
+    ADDRESS = b"12345"  # 5-byte address
+    PAYLOAD = b"Hello NRF24"
+
+    print("NRF24 Test - requires pigpio daemon running and NRF24 module connected.")
+    pi = pigpio.pi()
+    if not pi.connected:
+        print("Failed to connect to pigpio daemon. Is it running?")
+        sys.exit(1)
+
+    nrf = NRF24(pi, ce=CE_PIN, spi_channel=SPI_CH, payload_size=RF24_PAYLOAD.MAX, address_bytes=5)
+    print("NRF24 initialized.")
+    nrf.show_registers()
+
+    # Set channel, data rate, PA level
+    nrf.set_channel(76)
+    nrf.set_data_rate(RF24_DATA_RATE.RATE_1MBPS)
+    nrf.set_pa_level(RF24_PA.MAX)
+    print("Channel, data rate, PA set.")
+
+    # Set TX and RX addresses (both same for demo)
+    nrf.open_writing_pipe(ADDRESS)
+    nrf.open_reading_pipe(RF24_RX_ADDR.P1, ADDRESS)
+    print("Addresses set.")
+
+    # Send a test packet
+    print(f"Sending: {PAYLOAD}")
+    nrf.send(list(PAYLOAD))
+    try:
+        nrf.wait_until_sent()
+        print("Send completed.")
+    except TimeoutError as e:
+        print(f"Send timeout: {e}")
+
+    # Check status
+    status = nrf.get_status()
+    print(f"Status: 0x{status:02x}")
+
+    # Optionally check for received data (if another unit is transmitting)
+    if nrf.data_ready():
+        data = nrf.get_payload()
+        print(f"Received: {bytes(data)}")
+    else:
+        print("No data received.")
+
+    nrf.power_down()
+    pi.stop()
+    print("Test finished.")

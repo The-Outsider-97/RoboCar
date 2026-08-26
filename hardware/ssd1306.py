@@ -1,6 +1,7 @@
 # MicroPython SSD1306 OLED driver, I2C and SPI interfaces
 
 from micropython import const
+
 import framebuf
 
 
@@ -162,3 +163,28 @@ class SSD1306_SPI(SSD1306):
         self.cs(0)
         self.spi.write(buf)
         self.cs(1)
+
+
+__all__ = [
+    "SET_CONTRAST",
+    "SET_ENTIRE_ON",
+    "SET_NORM_INV",
+    "SET_DISP",
+    "SET_MEM_ADDR",
+    "SET_COL_ADDR",
+    "SET_PAGE_ADDR",
+    "SET_DISP_START_LINE",
+    "SET_SEG_REMAP",
+    "SET_MUX_RATIO",
+    "SET_IREF_SELECT",
+    "SET_COM_OUT_DIR",
+    "SET_DISP_OFFSET",
+    "SET_COM_PIN_CFG",
+    "SET_DISP_CLK_DIV",
+    "SET_PRECHARGE",
+    "SET_VCOM_DESEL",
+    "SET_CHARGE_PUMP",
+    "SSD1306",
+    "SSD1306_I2C",
+    "SSD1306_SPI",
+]

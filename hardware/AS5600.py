@@ -5,8 +5,25 @@ Based on the original Arduino library by Tom Denton
 Adapted for Raspberry Pi with smbus2
 """
 
+import platform
 import time
-from smbus2 import SMBus
+
+if platform.system() == 'Windows':
+    # Mock implementation for Windows
+    class SMBusMock:
+        def __init__(self, bus):
+            self.bus = bus
+        def write_byte_data(self, addr, reg, val):
+            pass
+        def read_byte_data(self, addr, reg):
+            return 0x68  # WHO_AM_I response
+        def read_i2c_block_data(self, addr, reg, length):
+            return [0] * length
+        # Add any other methods you use
+
+    smbus = type('smbus', (), {'SMBus': SMBusMock})()
+else:
+    from smbus2 import SMBus # type: ignore
 
 class AS5600:
     # I2C address
@@ -32,7 +49,7 @@ class AS5600:
         Initialize the AS5600 sensor
         :param i2c_bus: I2C bus number (default: 1 for Raspberry Pi)
         """
-        self.bus = SMBus(i2c_bus)
+        self.bus = smbus.SMBus(i2c_bus) # type: ignore
     
     def get_address(self):
         """
@@ -290,6 +307,11 @@ class AS5600:
         :param data: data to write
         """
         self.bus.write_byte_data(self._ams5600_address, register, data)
+
+
+__all__ = [
+    "AS5600",
+]
 
 
 # Example usage

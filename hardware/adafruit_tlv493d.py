@@ -181,3 +181,8 @@ class TLV493D:
         binval = struct.unpack_from(">h", bytearray([top, bottom]))[0]
         binval = binval >> 4
         return binval * 98.0
+
+__all__ = [
+    "_TLV493D_DEFAULT_ADDRESS",
+    "TLV493D",
+]
