@@ -142,9 +142,9 @@ class SSD1306_SPI(SSD1306):
         import time
 
         self.res(1)
-        time.sleep_ms(1)
+        time.sleep_ms(1) # type: ignore
         self.res(0)
-        time.sleep_ms(10)
+        time.sleep_ms(10) # type: ignore
         self.res(1)
         super().__init__(width, height, external_vcc)
 

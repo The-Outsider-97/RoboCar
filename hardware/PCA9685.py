@@ -30,15 +30,50 @@ from logs.logger import get_logger, PrettyPrinter # pyright: ignore[reportMissin
 logger = get_logger("PCA9685")
 printer = PrettyPrinter()
 
-def software_reset(self, i2c=None, **kwargs):
-    """Sends a software reset (SWRST) command to all servo drivers on the bus."""
-    # Setup I2C interface for device 0x00 to talk to all of them.
-    i2c = I2C
-    self._device = i2c.get_i2c_device(0x00, **kwargs)
-    self._device.writeRaw8(0x06)  # SWRST
 
 class PCA9685(object):
-    """PCA9685 16-channel 12-bit PWM LED/servo controller."""
+    """PCA9685 16-channel 12-bit PWM controller for RoboCar.
+
+    Channel numbering in this class is zero-based.  Therefore the physical
+    channel labels printed on the board map as follows::
+
+        board channel 1 -> index 0 -> ESC
+        board channel 2 -> index 1 -> steering servo
+        board channel 5 -> index 4 -> blue severity LED
+        board channel 6 -> index 5 -> green severity LED
+        board channel 7 -> index 6 -> yellow severity LED
+        board channel 8 -> index 7 -> red severity LED
+
+    The PCA9685 has one shared PWM frequency for all sixteen outputs.  RoboCar
+    therefore retains 50 Hz for the ESC and steering servo and performs the
+    requested 3-pulse-per-second severity pattern in software.
+    """
+
+    CHANNEL_COUNT        = 16
+
+    # RoboCar actuator allocation (board channels 1 and 2).
+    ESC_CHANNEL          = 0
+    STEERING_CHANNEL     = 1
+
+    # RoboCar severity-light allocation (board channels 5 through 8).
+    BLUE_LED_CHANNEL     = 4
+    GREEN_LED_CHANNEL    = 5
+    YELLOW_LED_CHANNEL   = 6
+    RED_LED_CHANNEL      = 7
+
+    SEVERITY_LED_CHANNELS = {
+        "blue": BLUE_LED_CHANNEL,
+        "green": GREEN_LED_CHANNEL,
+        "yellow": YELLOW_LED_CHANNEL,
+        "red": RED_LED_CHANNEL,
+    }
+    SEVERITY_LEVEL_COLORS = {
+        1: "blue",
+        2: "green",
+        3: "yellow",
+        4: "red",
+    }
+    DEFAULT_SEVERITY_RATE_HZ = 3.0
 
     # Register addresses
     PCA9685_ADDRESS     = 0x40
@@ -79,18 +114,22 @@ class PCA9685(object):
     SWRST_ADDRESS       = 0x00
     SWRST_COMMAND       = 0x06
 
-    def __init__(self, i2c_bus=1, address=0x40, sda_pin=2, scl_pin=3, freq=50):
+    def __init__(self, i2c_bus=1, address=0x40, sda_pin=2, scl_pin=3, freq=50, i2c=None):
         """
         Initialize PCA9685
-        
+
         Args:
             i2c_bus: I2C bus number (default 1 for Raspberry Pi)
             address: I2C address of PCA9685 (default 0x40)
             sda_pin: SDA pin number (default GPIO2 for Pi 5)
             scl_pin: SCL pin number (default GPIO3 for Pi 5)
             freq: PWM frequency in Hz (default 50 for servos)
+            i2c: optional pre‑configured I2C instance (for testing / simulation)
         """
-        self.i2c = I2C(i2c_bus, sda=Pin(sda_pin), scl=Pin(scl_pin))
+        if i2c is None:
+            self.i2c = I2C(i2c_bus, sda=Pin(sda_pin), scl=Pin(scl_pin))
+        else:
+            self.i2c = i2c
         self.address = address
         self.frequency = freq
 
@@ -181,20 +220,37 @@ class PCA9685(object):
         
         Args:
             channel: Channel number (0-15)
-            on: Tick when signal turns on (0-4095)
-            off: Tick when signal turns off (0-4095)
+            on: Tick when signal turns on (0-4095), or 4096 for full on
+            off: Tick when signal turns off (0-4095), or 4096 for full off
         """
-        if channel < 0 or channel > 15:
+        if channel < 0 or channel >= self.CHANNEL_COUNT:
             raise ValueError("Channel must be between 0 and 15")
-            
-        on = max(0, min(4095, on))
-        off = max(0, min(4095, off))
-        
-        # Write to LED registers
-        self.write_byte(self.LED0_ON_L + 4 * channel, on & 0xFF)
-        self.write_byte(self.LED0_ON_H + 4 * channel, on >> 8)
-        self.write_byte(self.LED0_OFF_L + 4 * channel, off & 0xFF)
-        self.write_byte(self.LED0_OFF_H + 4 * channel, off >> 8)
+
+        on = int(on)
+        off = int(off)
+        if not 0 <= on <= 4096 or not 0 <= off <= 4096:
+            raise ValueError("PWM on/off values must be between 0 and 4096")
+        if on == 4096 and off == 4096:
+            raise ValueError("A PCA9685 channel cannot be both fully on and fully off")
+
+        # Bit 4 of LEDn_ON_H / LEDn_OFF_H is the PCA9685 full-on/full-off bit.
+        # Handling the 4096 sentinel explicitly is essential: clamping it to
+        # 4095 makes led_off() produce an almost fully-on output.
+        base = self.LED0_ON_L + 4 * channel
+        if on == 4096:
+            on_l, on_h = 0x00, 0x10
+            off_l, off_h = 0x00, 0x00
+        elif off == 4096:
+            on_l, on_h = 0x00, 0x00
+            off_l, off_h = 0x00, 0x10
+        else:
+            on_l, on_h = on & 0xFF, (on >> 8) & 0x0F
+            off_l, off_h = off & 0xFF, (off >> 8) & 0x0F
+
+        self.write_byte(base, on_l)
+        self.write_byte(base + 1, on_h)
+        self.write_byte(base + 2, off_l)
+        self.write_byte(base + 3, off_h)
         
     def set_pulse_width(self, channel, pulse_width_us):
         """
@@ -217,9 +273,14 @@ class PCA9685(object):
             channel: Channel number (0-15)
             duty_cycle: Duty cycle percentage (0-100)
         """
-        duty_cycle = max(0, min(100, duty_cycle))
-        ticks = int((duty_cycle / 100.0) * 4095)
-        self.set_pwm(channel, 0, ticks)
+        duty_cycle = max(0.0, min(100.0, float(duty_cycle)))
+        if duty_cycle == 0.0:
+            self.set_pin(channel, 0)
+        elif duty_cycle == 100.0:
+            self.set_pin(channel, 1)
+        else:
+            ticks = int(round((duty_cycle / 100.0) * 4096.0))
+            self.set_pwm(channel, 0, min(4095, ticks))
         
     def set_servo_angle(self, channel, angle, min_pulse=1000, max_pulse=2000):
         """
@@ -240,7 +301,7 @@ class PCA9685(object):
         
     def set_motor_speed(self, channel, speed, min_pulse=1000, max_pulse=2000, neutral=1500):
         """
-        Set motor speed for continuous rotation servo
+        Set bidirectional ESC/motor command from -100 to 100.
         
         Args:
             channel: Channel number (0-15)
@@ -276,10 +337,32 @@ class PCA9685(object):
         else:
             self.set_pwm(channel, 0, 4096)  # Fully off
 
+    # LED-specific methods
+    def _validate_led_channel(self, channel):
+        """Reject actuator or unallocated channels passed to an LED method."""
+        if isinstance(channel, bool) or not isinstance(channel, int):
+            raise ValueError("LED channel must be an integer")
+        if channel not in self.SEVERITY_LED_CHANNELS.values():
+            allowed = ", ".join(
+                str(item) for item in self.SEVERITY_LED_CHANNELS.values()
+            )
+            raise ValueError(
+                "LED channel %r is not allocated to a severity LED; expected "
+                "one of the zero-based channels: %s" % (channel, allowed)
+            )
+        return channel
 
-    # ================================================
-    #  LED-specific methods
-    # ================================================
+    @staticmethod
+    def _validate_brightness(brightness):
+        """Return a finite LED brightness percentage in the closed 0-100 range."""
+        try:
+            value = float(brightness)
+        except (TypeError, ValueError):
+            raise ValueError("LED brightness must be a finite number from 0 to 100")
+        if not math.isfinite(value) or not 0.0 <= value <= 100.0:
+            raise ValueError("LED brightness must be a finite number from 0 to 100")
+        return value
+
     def set_led_brightness(self, channel, brightness):
         """
         Set LED brightness (0-100%)
@@ -288,7 +371,10 @@ class PCA9685(object):
             channel: Channel number (0-15)
             brightness: Brightness percentage (0-100)
         """
-        self.set_duty_cycle(channel, brightness)
+        self.set_duty_cycle(
+            self._validate_led_channel(channel),
+            self._validate_brightness(brightness),
+        )
         
     def led_on(self, channel):
         """
@@ -297,7 +383,7 @@ class PCA9685(object):
         Args:
             channel: Channel number (0-15)
         """
-        self.set_pin(channel, 1)
+        self.set_pin(self._validate_led_channel(channel), 1)
         
     def led_off(self, channel):
         """
@@ -306,7 +392,7 @@ class PCA9685(object):
         Args:
             channel: Channel number (0-15)
         """
-        self.set_pin(channel, 0)
+        self.set_pin(self._validate_led_channel(channel), 0)
         
     def fade_led(self, channel, start_brightness, end_brightness, duration=1.0, steps=50):
         """
@@ -348,34 +434,143 @@ class PCA9685(object):
             self.led_off(channel)
             time.sleep(off_time)
 
+    def clear_severity_leds(self):
+        """Turn off only the four configured severity LEDs.
+
+        The ESC and steering channels are deliberately excluded.  Global
+        ALL_LED register writes are unsafe when actuators and LEDs share one
+        PCA9685 because they would overwrite the ESC and servo waveforms.
+        """
+        for channel in self.SEVERITY_LED_CHANNELS.values():
+            self.led_off(channel)
+
+    def set_severity_led(self, color, brightness=100):
+        """Show one severity color continuously and turn the other three off.
+
+        Args:
+            color: One of ``blue``, ``green``, ``yellow``, or ``red``.
+            brightness: Active LED brightness from 0 to 100 percent.
+
+        Returns:
+            The zero-based PCA9685 channel used for the selected LED.
+        """
+        normalized = str(color).strip().lower()
+        if normalized not in self.SEVERITY_LED_CHANNELS:
+            allowed = ", ".join(self.SEVERITY_LED_CHANNELS)
+            raise ValueError("Unknown severity color %r; expected one of: %s" % (color, allowed))
+
+        channel = self.SEVERITY_LED_CHANNELS[normalized]
+        self.clear_severity_leds()
+        self.set_led_brightness(channel, brightness)
+        return channel
+
+    def set_severity_level(self, level, brightness=100):
+        """Show one of the four ordered severity levels continuously.
+
+        The order follows the supplied physical color order exactly:
+        level 1 is blue, level 2 green, level 3 yellow, and level 4 red.
+        No application-specific meaning is imposed on those four levels here.
+        """
+        if isinstance(level, bool) or not isinstance(level, int):
+            raise ValueError("severity level must be an integer from 1 through 4")
+        color = self.SEVERITY_LEVEL_COLORS.get(level)
+        if color is None:
+            raise ValueError("severity level must be an integer from 1 through 4")
+        return self.set_severity_led(color, brightness=brightness)
+
+    def blink_severity_led(
+        self,
+        color,
+        pulses=3,
+        rate_hz=DEFAULT_SEVERITY_RATE_HZ,
+        brightness=100,
+    ):
+        """Blink one severity LED at an exact pulse rate.
+
+        A pulse consists of one on phase plus one off phase.  At the RoboCar
+        default of 3 Hz, each phase lasts 1/6 second and three complete pulses
+        take one second.  This method is intentionally finite and blocking; it
+        never pulses the ESC channel.
+
+        Args:
+            color: One of ``blue``, ``green``, ``yellow``, or ``red``.
+            pulses: Number of complete on/off pulses; must be a positive int.
+            rate_hz: Complete pulses per second; must be greater than zero.
+            brightness: Active LED brightness from 0 to 100 percent.
+
+        Returns:
+            The zero-based PCA9685 channel used for the selected LED.
+        """
+        if isinstance(pulses, bool) or not isinstance(pulses, int) or pulses <= 0:
+            raise ValueError("pulses must be a positive integer")
+
+        rate_hz = float(rate_hz)
+        if not math.isfinite(rate_hz) or rate_hz <= 0.0:
+            raise ValueError("rate_hz must be a finite value greater than zero")
+
+        normalized = str(color).strip().lower()
+        if normalized not in self.SEVERITY_LED_CHANNELS:
+            allowed = ", ".join(self.SEVERITY_LED_CHANNELS)
+            raise ValueError("Unknown severity color %r; expected one of: %s" % (color, allowed))
+
+        channel = self.SEVERITY_LED_CHANNELS[normalized]
+        half_period = 0.5 / rate_hz
+        self.clear_severity_leds()
+        try:
+            self.blink_led(
+                channel,
+                times=pulses,
+                on_time=half_period,
+                off_time=half_period,
+                brightness=brightness,
+            )
+        finally:
+            # A completed, interrupted, or failed finite pattern always leaves
+            # the severity bank in a deterministic off state.
+            self.clear_severity_leds()
+        return channel
+
+    def blink_severity_level(
+        self,
+        level,
+        pulses=3,
+        rate_hz=DEFAULT_SEVERITY_RATE_HZ,
+        brightness=100,
+    ):
+        """Blink severity level 1-4 using its assigned color channel."""
+        if isinstance(level, bool) or not isinstance(level, int):
+            raise ValueError("severity level must be an integer from 1 through 4")
+        color = self.SEVERITY_LEVEL_COLORS.get(level)
+        if color is None:
+            raise ValueError("severity level must be an integer from 1 through 4")
+        return self.blink_severity_led(
+            color,
+            pulses=pulses,
+            rate_hz=rate_hz,
+            brightness=brightness,
+        )
+
     def set_all_leds_brightness(self, brightness):
         """
-        Set all LEDs to the same brightness
+        Set the four RoboCar severity LEDs to the same brightness.
+
+        This compatibility method no longer writes the PCA9685 ALL_LED
+        registers because channels 0 and 1 control physical actuators.
         
         Args:
             brightness: Brightness percentage (0-100)
         """
-        ticks = int((brightness / 100.0) * 4095)
-
-        # Use ALL_LED registers to set all channels at once
-        self.write_byte(self.ALL_LED_ON_L, 0)
-        self.write_byte(self.ALL_LED_ON_H, 0)
-        self.write_byte(self.ALL_LED_OFF_L, ticks & 0xFF)
-        self.write_byte(self.ALL_LED_OFF_H, ticks >> 8)
+        for channel in self.SEVERITY_LED_CHANNELS.values():
+            self.set_led_brightness(channel, brightness)
 
     def all_leds_on(self):
-        """Turn all LEDs fully on"""
-        self.write_byte(self.ALL_LED_ON_L, 0)
-        self.write_byte(self.ALL_LED_ON_H, 0x10)  # Set full on bit
-        self.write_byte(self.ALL_LED_OFF_L, 0)
-        self.write_byte(self.ALL_LED_OFF_H, 0)
+        """Turn all four RoboCar severity LEDs fully on."""
+        for channel in self.SEVERITY_LED_CHANNELS.values():
+            self.led_on(channel)
 
     def all_leds_off(self):
-        """Turn all LEDs fully off"""
-        self.write_byte(self.ALL_LED_ON_L, 0)
-        self.write_byte(self.ALL_LED_ON_H, 0)
-        self.write_byte(self.ALL_LED_OFF_L, 0)
-        self.write_byte(self.ALL_LED_OFF_H, 0x10)  # Set full off bit
+        """Turn all four RoboCar severity LEDs fully off."""
+        self.clear_severity_leds()
 
     def write_byte(self, reg, value):
         """Write byte to register"""
@@ -397,31 +592,84 @@ class PCA9685(object):
 
 
 __all__ = [
-    "software_reset",
     "PCA9685",
 ]
 
 
-# Example usage
 if __name__ == "__main__":
-    # Initialize PCA9685
-    pwm = PCA9685(i2c_bus=1, address=0x40, sda_pin=2, scl_pin=3, freq=50)
-    
-    # Example: Control steering servo on channel 0
-    pwm.set_servo_angle(0, 90)  # Center position
-    
-    # Example: Control motor on channel 1
-    pwm.set_motor_speed(1, 0)   # Stop
+    print("\n=== Running PCA9685 Hardware Test ===\n")
+    printer.status("TEST", "Starting PCA9685 channel-allocation test", "info")
 
-    # Example: LED control on channel 2
-    pwm.set_led_brightness(2, 50)   # 50% brightness
-    pwm.fade_led(2, 0, 100, 2.0)    # Fade from 0 to 100% over 2 seconds
-    pwm.blink_led(2, times=5)       # Blink 5 times
-    
-    # Example: Control all LEDs
-    pwm.set_all_leds_brightness(25)  # All LEDs at 25% brightness
-    
-    # Example: Software reset (can be called without instance)
-    # PCA9685.software_reset()
-    
-    print("PCA9685 initialized successfully!")
+    pwm = None
+    test_succeeded = False
+    try:
+        pwm = PCA9685(
+            i2c_bus=1,
+            address=0x40,
+            sda_pin=2,
+            scl_pin=3,
+            freq=50,
+        )
+
+        # Safety first: the test never commands non-zero motor throttle.
+        pwm.set_motor_speed(PCA9685.ESC_CHANNEL, 0)
+        printer.status(
+            "TEST",
+            "ESC neutral confirmed on board channel 1 (index 0)",
+            "info",
+        )
+
+        pwm.set_servo_angle(PCA9685.STEERING_CHANNEL, 90)
+        printer.status(
+            "TEST",
+            "Steering centered on board channel 2 (index 1)",
+            "info",
+        )
+
+        # Each color produces three complete pulses in one second: 3 pulses/s.
+        for level, color in PCA9685.SEVERITY_LEVEL_COLORS.items():
+            channel = PCA9685.SEVERITY_LED_CHANNELS[color]
+            printer.status(
+                "TEST",
+                "Level %d / %s LED: board channel %d (index %d), 3 pulses/s"
+                % (level, color.capitalize(), channel + 1, channel),
+                "info",
+            )
+            pwm.blink_severity_level(
+                level,
+                pulses=3,
+                rate_hz=PCA9685.DEFAULT_SEVERITY_RATE_HZ,
+                brightness=100,
+            )
+
+        test_succeeded = True
+        printer.status("TEST", "PCA9685 channel test completed", "success")
+
+    except Exception as exc:
+        printer.status(
+            "TEST",
+            "PCA9685 hardware test failed: %s: %s"
+            % (type(exc).__name__, exc),
+            "error",
+        )
+        raise
+
+    finally:
+        if pwm is not None:
+            # Leave the car in a deterministic safe state even when the test is
+            # interrupted: motor neutral, steering centered, severity LEDs off.
+            try:
+                pwm.set_motor_speed(PCA9685.ESC_CHANNEL, 0)
+            except Exception as exc:
+                printer.status("TEST", "ESC cleanup failed: %s" % exc, "error")
+            try:
+                pwm.set_servo_angle(PCA9685.STEERING_CHANNEL, 90)
+            except Exception as exc:
+                printer.status("TEST", "Steering cleanup failed: %s" % exc, "error")
+            try:
+                pwm.clear_severity_leds()
+            except Exception as exc:
+                printer.status("TEST", "LED cleanup failed: %s" % exc, "error")
+
+    if test_succeeded:
+        print("\n=== Test ran successfully ===\n")

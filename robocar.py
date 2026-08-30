@@ -873,8 +873,16 @@ class RoboCar:
             if isinstance(hardware.get("pico_serial"), Mapping)
             else {}
         )
-        port = sensor_port if sensor_port is not None else serial_cfg.get("port", "auto")
-        baud = optional_int(serial_cfg.get("baud"), minimum=1) or 115200
+        lighting_cfg = get_config_section("lighting", self.config)
+        port = (
+            sensor_port
+            if sensor_port is not None
+            else serial_cfg.get("port", "auto")
+        )
+        baud = optional_int(
+            serial_cfg.get("baud"),
+            minimum=1,
+        ) or 115200
 
         self.allow_simulation = bool(allow_simulation)
         self.shared_memory = shared_memory if shared_memory is not None else SharedMemory()
@@ -910,7 +918,24 @@ class RoboCar:
             port=str(port) if port is not None else "auto",
             baud=baud,
             allow_simulation=self.allow_simulation,
+            lighting_config=lighting_cfg,
         )
+        minimum_turn_angle_deg = optional_finite_float(
+            lighting_cfg.get("turn_detection_min_angle_deg", 10.0),
+            minimum=0.0,
+            maximum=180.0,
+        )
+        
+        if (
+            minimum_turn_angle_deg is None
+            or minimum_turn_angle_deg <= 0.0
+        ):
+            raise ValueError(
+                "lighting.turn_detection_min_angle_deg "
+                "must be within (0, 180]"
+            )
+        
+        self._turn_detection_min_angle_rad = math.radians(minimum_turn_angle_deg)
 
         # -------------------------- deterministic state --------------------
         self.world_model = WorldModel(
@@ -1143,10 +1168,7 @@ class RoboCar:
                     event="robocar_started",
                     payload={"health": self._core_health_snapshot()},
                 )
-                logger.info(
-                    "RoboCar started (simulation_allowed=%s)",
-                    self.allow_simulation,
-                )
+                logger.info("RoboCar started (simulation_allowed=%s)", self.allow_simulation)
             except Exception:
                 # Startup failure must never leave a previously initialized PWM
                 # boundary energized.
@@ -1236,9 +1258,7 @@ class RoboCar:
                 self._last_error = (
                     f"stop_during_close: {type(exc).__name__}: {exc}"
                 )
-                logger.critical(
-                    "RoboCar failed to confirm neutral during close: %s", exc
-                )
+                logger.critical("RoboCar failed to confirm neutral during close: %s", exc)
 
             loop = self.autonomy_loop
             if loop is not None:
@@ -1582,6 +1602,207 @@ class RoboCar:
         return value
 
     # ------------------------------------------------------------------
+    # Vehicle-lighting intent
+    # ------------------------------------------------------------------
+    
+    def set_drive_intent(self, keep_driving: bool) -> Dict[str, Any]:
+        """Set normal driving-light intent without changing vehicle motion."""
+    
+        command = self.sensor_bus.set_drive_intent(
+            keep_driving
+        )
+        return command.to_payload()
+    
+    def update_turn_intent(
+        self,
+        direction: Optional[str],
+        distance_to_turn_m: Optional[float],
+    ) -> Dict[str, Any]:
+        """Update a planner/localizer-provided upcoming turn measurement.
+    
+        The appropriate indicator remains off until the supplied distance reaches
+        the configured one-metre activation boundary.
+        """
+    
+        command = self.sensor_bus.set_turn_intent(
+            direction,
+            distance_to_turn_m,
+        )
+        return command.to_payload()
+    
+    def park(self, *, reason: str = "stationary_parking_intent") -> Dict[str, Any]:
+        """Stop the chassis and start the finite parking-light acknowledgement."""
+    
+        if not self._started:
+            raise RuntimeError(
+                "RoboCar.start() must be called before parking"
+            )
+    
+        hardware = self._safe_hardware_stop(reason)
+        lighting = self.sensor_bus.park_lighting()
+        snapshot = self.world_model.snapshot()
+    
+        self.world_model.update(
+            autonomy=AutonomyState(
+                mode=OperatingMode.STOPPED,
+                run_id=snapshot.autonomy.run_id,
+                goal_id=snapshot.autonomy.goal_id,
+                cycle=snapshot.autonomy.cycle,
+                planner_status=snapshot.autonomy.planner_status,
+                last_plan_monotonic=(
+                    snapshot.autonomy.last_plan_monotonic
+                ),
+                last_control_cycle_monotonic=(
+                    snapshot.autonomy.last_control_cycle_monotonic
+                ),
+                last_recovery_monotonic=(
+                    snapshot.autonomy.last_recovery_monotonic
+                ),
+                metadata={
+                    **dict(snapshot.autonomy.metadata or {}),
+                    "park_reason": str(reason),
+                },
+            ),
+            event_type="vehicle.parked",
+            event_payload={
+                "reason": str(reason),
+                "lighting": lighting.to_payload(),
+            },
+        )
+    
+        return {
+            "status": "parked",
+            "reason": str(reason),
+            "hardware": hardware,
+            "lighting": lighting.to_payload(),
+        }
+    
+    def _update_route_turn_lighting(self, command: TrajectoryCommand) -> None:
+        """Derive the next material route bend and update turn-light intent."""
+    
+        snapshot = self.world_model.snapshot()
+    
+        direction, distance_m = self._upcoming_route_turn(
+            snapshot,
+            active_index=command.target_index,
+        )
+    
+        self.sensor_bus.set_drive_intent(True)
+        self.sensor_bus.set_turn_intent(
+            direction,
+            distance_m,
+        )
+    
+    def _upcoming_route_turn(self, snapshot: WorldSnapshot, *, active_index: int) -> tuple[Optional[str], Optional[float]]:
+        """Return the next significant route bend and along-path distance.
+    
+        Small waypoint-to-waypoint changes are accumulated so a densely sampled
+        curve can still be recognized. Opposing changes reset the accumulated
+        angle, preventing ordinary waypoint noise from producing a false turn.
+        """
+    
+        pose = snapshot.pose
+        route = snapshot.route
+    
+        if pose is None or len(route.waypoints) < 2:
+            return None, None
+    
+        index = max(
+            0,
+            min(
+                int(active_index),
+                len(route.waypoints) - 1,
+            ),
+        )
+    
+        vertices = [
+            (pose.x_m, pose.y_m),
+            *[
+                (point.x_m, point.y_m)
+                for point in route.waypoints[index:]
+            ],
+        ]
+    
+        if len(vertices) < 3:
+            return None, None
+    
+        cumulative_distance = 0.0
+        accumulated_angle = 0.0
+        turn_start_distance: Optional[float] = None
+        previous_sign = 0
+    
+        for vertex_index in range(1, len(vertices) - 1):
+            previous = vertices[vertex_index - 1]
+            vertex = vertices[vertex_index]
+            following = vertices[vertex_index + 1]
+    
+            incoming_dx = vertex[0] - previous[0]
+            incoming_dy = vertex[1] - previous[1]
+            outgoing_dx = following[0] - vertex[0]
+            outgoing_dy = following[1] - vertex[1]
+    
+            incoming_length = math.hypot(
+                incoming_dx,
+                incoming_dy,
+            )
+            outgoing_length = math.hypot(
+                outgoing_dx,
+                outgoing_dy,
+            )
+    
+            cumulative_distance += incoming_length
+    
+            if (
+                incoming_length <= 1e-9
+                or outgoing_length <= 1e-9
+            ):
+                continue
+    
+            incoming_heading = math.atan2(
+                incoming_dy,
+                incoming_dx,
+            )
+            outgoing_heading = math.atan2(
+                outgoing_dy,
+                outgoing_dx,
+            )
+    
+            delta = math.atan2(
+                math.sin(outgoing_heading - incoming_heading),
+                math.cos(outgoing_heading - incoming_heading),
+            )
+    
+            if abs(delta) <= 1e-6:
+                continue
+    
+            sign = 1 if delta > 0.0 else -1
+    
+            if previous_sign and sign != previous_sign:
+                accumulated_angle = 0.0
+                turn_start_distance = None
+    
+            if turn_start_distance is None:
+                turn_start_distance = cumulative_distance
+    
+            previous_sign = sign
+            accumulated_angle += delta
+    
+            if (
+                abs(accumulated_angle)
+                >= self._turn_detection_min_angle_rad
+            ):
+                return (
+                    (
+                        "left"
+                        if accumulated_angle > 0.0
+                        else "right"
+                    ),
+                    max(0.0, turn_start_distance),
+                )
+    
+        return None, None
+
+    # ------------------------------------------------------------------
     # World / KPI helpers
     # ------------------------------------------------------------------
 
@@ -1851,6 +2072,9 @@ class RoboCar:
             )
 
         watchdog = self.check_watchdog(enforce=True)
+        # A temporary stop between trajectory-control steps still represents an
+        # intent to continue driving. Keep the head and tail lights enabled.
+        self.sensor_bus.set_drive_intent(True)
         if watchdog.requires_stop:
             return {
                 "status": "blocked",
@@ -2166,22 +2390,22 @@ class RoboCar:
         source: str = "trajectory_controller",
     ) -> Dict[str, Any]:
         """Compute and execute one bounded trajectory-control step."""
-
-        duration = require_finite_float(
-            duration_s, "trajectory.duration_s", minimum=1e-9
-        )
-        command = self.compute_trajectory_command(
-            desired_speed_mps=desired_speed_mps
-        )
+    
+        duration = require_finite_float(duration_s, "trajectory.duration_s", minimum=1e-9)
+        command = self.compute_trajectory_command(desired_speed_mps=desired_speed_mps)
+    
         if command.goal_reached:
-            hardware = self._safe_hardware_stop("trajectory_goal_reached")
+            parking = self.park(reason="trajectory_goal_reached")
+    
             return {
                 "status": "completed",
                 "goal_reached": True,
                 "command": _serialize(command),
-                "hardware": hardware,
+                "parking": parking,
             }
-
+    
+        self._update_route_turn_lighting(command)
+    
         result = self.execute_ackermann_action(
             throttle=command.throttle,
             steering=command.steering,
@@ -2190,6 +2414,7 @@ class RoboCar:
             require_slai_safety=True,
             allow_persistent=False,
         )
+    
         return {
             "status": result.get("status", "unknown"),
             "goal_reached": False,
@@ -2284,11 +2509,12 @@ class RoboCar:
 
     def service(self) -> WatchdogReport:
         """Run one deterministic supervisory service iteration.
-
-        Call this from the outer process at a stable cadence (for example the
-        existing rc_main loop).  No hidden watchdog thread is introduced.
+    
+        Call this from the outer process at a stable cadence, such as the existing
+        ``rc_main`` loop. No additional watchdog or lighting thread is introduced.
         """
-
+    
+        self.sensor_bus.service_lighting()
         return self.check_watchdog(enforce=True)
 
     def _record_watchdog_event(self, event: WatchdogEvent) -> None:
@@ -3052,6 +3278,7 @@ class RoboCar:
                 "hardware",
                 "power",
                 "robocar",
+                "lighting",
                 "watchdog",
                 "kpi",
                 "adaptation",

@@ -26,7 +26,6 @@ import time
 from dataclasses import dataclass
 from typing import Any, Optional, Protocol, Sequence, Tuple
 
-from ..motion_controller import PIDSpeedController
 from ..utils.rc_helpers import *
 from .world_model import *
 
@@ -234,9 +233,11 @@ class LongitudinalPIDController:
         *,
         config: Optional[dict[str, Any]] = None,
     ) -> None:
-        self.pid: SpeedController = (
-            pid if pid is not None else PIDSpeedController(config=config)
-        )
+        # Lazy import to avoid circular dependency
+        if pid is None:
+            from ..motion_controller import PIDSpeedController
+            pid = PIDSpeedController(config=config)
+        self.pid: SpeedController = pid
 
     def reset(self) -> None:
         self.pid.reset()

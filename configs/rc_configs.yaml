@@ -8,8 +8,8 @@ encoder:
 
 motion:
   pwm_freq_hz: 50
-  steer_channel: 0
-  throttle_channel: 1
+  throttle_channel: 0  # Physical PCA9685 channel 1: ESC
+  steer_channel: 1     # Physical PCA9685 channel 2: steering servo
   esc_min_us: 1000
   esc_max_us: 2000
   esc_neutral_us: 1500
@@ -28,8 +28,8 @@ speed:
 hardware:
   pwm_driver: "PCA9685"
   pwm_freq_hz: 50
-  steer_channel: 0
-  throttle_channel: 1
+  steer_channel: 1
+  throttle_channel: 0
   esc_type: "Hobbywing_Quicrun_1060"
   esc_min_us: 1000
   esc_max_us: 2000

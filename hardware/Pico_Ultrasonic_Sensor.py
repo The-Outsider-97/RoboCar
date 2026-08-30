@@ -40,10 +40,31 @@ POSSIBILITY OF SUCH DAMAGE.
 
 # DIYables_Pico_Ultrasonic_Sensor.py
 
-from machine import Pin
-import time
-import utime
-import machine
+import time as _time
+
+from ..modules.machine import Pin, ADC
+from logs.logger import get_logger, PrettyPrinter # pyright: ignore[reportMissingImports]
+
+logger = get_logger("HC-SR04")
+printer = PrettyPrinter()
+
+class utime:
+    """Stand‑in for MicroPython's utime module on CPython."""
+    @staticmethod
+    def sleep_us(us: int) -> None:
+        _time.sleep(us / 1_000_000.0)
+
+    @staticmethod
+    def sleep_ms(ms: int) -> None:
+        _time.sleep(ms / 1000.0)
+
+    @staticmethod
+    def ticks_us() -> int:
+        return int(_time.perf_counter() * 1_000_000)
+
+    @staticmethod
+    def ticks_diff(t1: int, t2: int) -> int:
+        return t1 - t2
 
 class UltrasonicSensor:
     def __init__(self, trig_pin, echo_pin, vsys_pin=None):
@@ -62,7 +83,7 @@ class UltrasonicSensor:
         self.cm_per_us = 0.017  # Default at 20°C
         self.vsys_pin = vsys_pin
         if vsys_pin:
-            self.adc = machine.ADC(machine.Pin(vsys_pin))
+            self.adc = ADC(Pin(vsys_pin))
 
         # Initialize trigger to low
         self.trig.low()
@@ -87,11 +108,11 @@ class UltrasonicSensor:
         """Perform a measurement cycle and update the list of distances."""
         # Ensure the trigger pin is low for a clean pulse
         self.trig.low()
-        time.sleep_us(2)
+        utime.sleep_us(2)
         
         # Send a 12 microsecond pulse to start the measurement
         self.trig.high()
-        time.sleep_us(12)
+        utime.sleep_us(12)
         self.trig.low()
 
         # Wait for the echo to start
@@ -233,3 +254,26 @@ class UltrasonicSensor:
 __all__ = [
     "UltrasonicSensor",
 ]
+
+if __name__ == "__main__":
+    print("\n=== Running HC-SR04 Hardware Test ===\n")
+    printer.status("TEST", "Starting HC-SR04 test", "info")
+    
+    # Enable GPIO simulation for this test
+    Pin._simulate_gpio = True
+
+    echo = 4
+    trig = 5
+
+    Sensor = UltrasonicSensor(trig_pin=trig, echo_pin=echo)
+    printer.status("SENSOR", Sensor, "success" if Sensor == "success" else "error")
+
+    distance = 10
+    readings=10
+
+    calibrate = Sensor.calibrate(known_distance=distance, num_readings=readings)
+    loop = Sensor.loop()
+    printer.status("LOOP", loop, "success" if loop == "success" else "error")
+    printer.status("CALIBRATE", calibrate, "success" if calibrate == "success" else "error")
+
+    print("\n=== Test ran successfully ===\n")
