@@ -20,10 +20,11 @@
 # THE SOFTWARE.
 
 from __future__ import division
+
 import math
 import time
 
-from machine import Pin, I2C # type: ignore
+from ..modules.machine import Pin, I2C
 from logs.logger import get_logger, PrettyPrinter # pyright: ignore[reportMissingImports]
 
 logger = get_logger("PCA9685")
@@ -275,7 +276,10 @@ class PCA9685(object):
         else:
             self.set_pwm(channel, 0, 4096)  # Fully off
 
-    # LED-specific methods
+
+    # ================================================
+    #  LED-specific methods
+    # ================================================
     def set_led_brightness(self, channel, brightness):
         """
         Set LED brightness (0-100%)
