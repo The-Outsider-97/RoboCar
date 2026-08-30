@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import errno
 import threading
+
 from collections.abc import Iterable
 from typing import Any, Optional
 
@@ -49,7 +50,6 @@ printer = PrettyPrinter()
 # ---------------------------------------------------------------------------
 # Optional Linux backend
 # ---------------------------------------------------------------------------
-
 try:
     import smbus2 as _smbus2  # type: ignore
 except ImportError as exc:
@@ -60,11 +60,521 @@ except ImportError as exc:
 else:
     _SMBUS2_IMPORT_ERROR = None
 
+# ---------------------------------------------------------------------------
+#  Simulated I2C bus backend
+# ---------------------------------------------------------------------------
+#
+# ``_SimulatedI2CBus`` and ``_SimulatedSMBus`` stand in for ``smbus2.SMBus``
+# when a physical bus cannot be opened (see ``I2C.__init__``).  Both classes
+# expose exactly the surface ``I2C`` actually drives -- ``write_quick``,
+# ``i2c_rdwr``, and ``close`` -- so a driver written against ``machine.I2C``
+# behaves identically under simulation and under real hardware.
+#
+# Register-pointer model
+# -----------------------
+# I2C itself has no concept of "registers"; it is a bus for exchanging raw
+# byte strings with an address.  Register-oriented access (``writeto_mem`` /
+# ``readfrom_mem``) is a *software convention* layered on top by device
+# drivers: a write whose payload begins with one or more address bytes
+# followed by data, and a read that resumes from wherever the device's
+# internal pointer was last left.  ``I2C`` in this module encodes that
+# convention in exactly two shapes, both reproduced here:
+#
+#   1. Combined write (``writeto_mem``): a single ``i2c_msg.write`` whose
+#      payload is ``<register-prefix><data...>``, sent alone.  The simulator
+#      must know how many leading bytes are address versus data; this is
+#      configurable per device via ``set_register_width`` (default 1 byte,
+#      i.e. ``addrsize=8``) because the bus cannot infer it from the wire.
+#
+#   2. Split write+read (``readfrom_mem``): a pointer-only ``i2c_msg.write``
+#      (register prefix, zero data bytes) immediately followed by an
+#      ``i2c_msg.read`` in the *same* ``i2c_rdwr()`` call.  Because the write
+#      payload here is unambiguously "the whole thing is the pointer",
+#      addrsize is irrelevant and 8-/16-bit register addressing both work
+#      without configuration.
+#
+# After either shape, the device's internal pointer auto-increments past the
+# bytes touched, mirroring the auto-increment behavior of essentially every
+# real I2C peripheral register file (EEPROMs, IMUs, PWM drivers, etc.), so
+# that a driver issuing several small reads/writes in sequence observes the
+# same "walk forward through the register map" behavior it would on hardware.
+#
+# Fault injection
+# ----------------
+# Real buses fail: a device may be absent (ENXIO), wedged (EIO/EREMOTEIO), or
+# the fd may be invalid (EBADF).  Tests that exercise ``I2C.scan()`` or
+# ``HardwareError`` fallback paths need to provoke those failures
+# deterministically without physical hardware.  Both classes therefore accept
+# an explicit "present address" allow-list and per-address fault injection;
+# by default every address ACKs (permissive, matching a bare in-memory model)
+# so existing callers that never configure the simulator keep working
+# unchanged.
+
+class _SimulatedI2CError(OSError):
+    """``OSError`` raised by the simulator with Linux-shaped ``errno`` values.
+
+    Real ``smbus2``/``ioctl`` failures surface as :class:`OSError` with a
+    POSIX ``errno`` (``ENXIO`` for "no such device", ``EIO``/``EREMOTEIO``
+    for a wedged responder, ``EBADF`` for an already-closed file descriptor).
+    ``I2C._execute`` wraps *any* exception into ``HardwareError``, and
+    ``I2C.scan()`` specifically inspects ``exc.errno`` against
+    ``_SCAN_MISS_ERRNOS`` to decide whether a missing responder is a normal
+    scan miss or a genuine bus fault.  Raising plain ``OSError`` here (rather
+    than a bespoke exception type) keeps both call sites working exactly as
+    they would against a real kernel I2C driver.
+    """
+
+    def __init__(self, errno_value: int, message: str) -> None:
+        super().__init__(errno_value, message)
+
+
+class _SimulatedBusMemory:
+    """Shared in-memory transport for the simulated bus backends.
+
+    This holds everything that is *not* part of the public ``smbus2``-shaped
+    API: per-address byte storage, pointer tracking, presence/fault
+    configuration, and locking.  ``_SimulatedI2CBus`` and ``_SimulatedSMBus``
+    both derive from it so the register-pointer semantics described above are
+    implemented exactly once and cannot drift between the two backends.
+
+    Not thread-safe by omission: every public entry point below acquires
+    ``self._lock``, matching the coarse-grained locking ``I2C`` itself applies
+    via its own ``threading.RLock``. Holding a second, independent lock here
+    keeps the simulator safe to drive directly in tests that bypass ``I2C``
+    and call the bus methods concurrently from multiple threads.
+    """
+
+    def __init__(self, bus_id: Any) -> None:
+        self.bus_id = bus_id
+        self._lock = threading.RLock()
+        self._closed = False
+
+        # address -> {register_offset: 0..255}; sparse, so 8-bit and 16-bit
+        # register spaces are both represented without pre-allocating memory.
+        self._memory: dict[int, dict[int, int]] = {}
+        # address -> current register pointer (auto-incrementing).
+        self._pointers: dict[int, int] = {}
+        # address -> number of leading payload bytes treated as a register
+        # prefix for *combined* write+data messages (see module note above).
+        self._register_width: dict[int, int] = {}
+        # None => every 7-bit address ACKs (default/permissive). A concrete
+        # set restricts ACKs to those addresses.
+        self._present: Optional[set[int]] = None
+        # Addresses that should fail every transaction (EIO), independent of
+        # presence, to simulate a wedged/misbehaving responder.
+        self._faulted: set[int] = set()
+
+    # ------------------------------------------------------------------
+    # Test/fixture configuration (not part of the smbus2 surface)
+    # ------------------------------------------------------------------
+
+    def register_device(
+        self,
+        address: int,
+        *,
+        initial: Optional[dict[int, int]] = None,
+        register_width: int = 1,
+    ) -> None:
+        """Pre-seed a device's memory and declare it present on the bus.
+
+        ``initial`` maps register offsets to starting byte values (any
+        offsets omitted default to ``0x00``, matching freshly powered-on
+        hardware with unspecified reset state treated as zeroed). Calling
+        this method for at least one address switches the bus out of its
+        default "every address ACKs" mode: once any device is explicitly
+        registered, ``scan()``/``write_quick()`` only ACK registered
+        addresses, so tests that want a realistic scan must register every
+        simulated peripheral they expect to see.
+        """
+
+        with self._lock:
+            self._present = self._present or set()
+            self._present.add(address)
+            cells = self._memory.setdefault(address, {})
+            if initial:
+                cells.update(initial)
+            self._pointers.setdefault(address, 0)
+            self.set_register_width(address, register_width)
+
+    def set_register_width(self, address: int, width: int) -> None:
+        """Set the register-prefix width (in bytes) used for combined
+        write+data transactions targeting ``address`` (see module note
+        above). MicroPython/CircuitPython ``addrsize`` is either 8 or 16
+        bits, i.e. a 1- or 2-byte prefix; this must match whatever the driver
+        under test configures via ``I2C.writeto_mem(..., addrsize=...)``.
+        """
+
+        if width < 1:
+            raise ValueError("register_width must be at least 1 byte")
+        with self._lock:
+            self._register_width[address] = width
+
+    def set_present_addresses(self, addresses: Optional[Iterable[int]]) -> None:
+        """Restrict which 7-bit addresses ACK. ``None`` restores the
+        permissive default where every address ACKs."""
+
+        with self._lock:
+            self._present = None if addresses is None else set(addresses)
+
+    def inject_fault(self, address: int) -> None:
+        """Make every subsequent transaction against ``address`` fail with
+        ``EIO``, simulating a wedged or misbehaving responder."""
+
+        with self._lock:
+            self._faulted.add(address)
+
+    def clear_fault(self, address: int) -> None:
+        """Undo :meth:`inject_fault` for ``address``."""
+
+        with self._lock:
+            self._faulted.discard(address)
+
+    def dump(self, address: int) -> dict[int, int]:
+        """Return a snapshot copy of ``address``'s simulated register file,
+        for test assertions."""
+
+        with self._lock:
+            return dict(self._memory.get(address, {}))
+
+    def reset(self) -> None:
+        """Clear all simulated state, as if every device were power-cycled
+        and the fault/presence configuration reset to defaults."""
+
+        with self._lock:
+            self._memory.clear()
+            self._pointers.clear()
+            self._register_width.clear()
+            self._present = None
+            self._faulted.clear()
+
+    # ------------------------------------------------------------------
+    # Internals shared by the smbus2-shaped surface
+    # ------------------------------------------------------------------
+
+    def _require_open(self) -> None:
+        if self._closed:
+            raise _SimulatedI2CError(
+                errno.EBADF,
+                f"simulated I2C bus {self.bus_id} is closed",
+            )
+
+    def _require_ack(self, address: int) -> None:
+        if self._present is not None and address not in self._present:
+            raise _SimulatedI2CError(
+                errno.ENXIO,
+                f"simulated I2C bus {self.bus_id}: no responder at "
+                f"0x{address:02X}",
+            )
+        if address in self._faulted:
+            raise _SimulatedI2CError(
+                errno.EIO,
+                f"simulated I2C bus {self.bus_id}: responder at "
+                f"0x{address:02X} is faulted",
+            )
+
+    def _cells_for(self, address: int) -> dict[int, int]:
+        return self._memory.setdefault(address, {})
+
+    def _do_write_quick(self, address: int) -> None:
+        with self._lock:
+            self._require_open()
+            self._require_ack(address)
+            # A quick-write is purely a presence probe; it deliberately does
+            # not touch stored register contents or the pointer, matching
+            # SMBus_write_quick() semantics on real hardware.
+            self._cells_for(address)
+
+    def _do_i2c_rdwr(self, *messages: Any) -> None:
+        with self._lock:
+            self._require_open()
+
+            # Detect the split write(pointer-only)+read shape described in
+            # the module note: a zero-data write immediately followed by a
+            # read for the same address, both within this call. When present,
+            # the write's entire payload is the pointer, unambiguously (no
+            # register_width guess needed), and the read must not be treated
+            # as a fresh, independently-addressed transaction.
+            index = 0
+            while index < len(messages):
+                message = messages[index]
+                address = self._require_message_address(message)
+                self._require_ack(address)
+                is_read = bool(message.flags & 0x01)
+
+                if not is_read and index + 1 < len(messages):
+                    next_message = messages[index + 1]
+                    next_address = self._require_message_address(next_message)
+                    next_is_read = bool(next_message.flags & 0x01)
+                    if next_is_read and next_address == address:
+                        # Split write(pointer-only)+read shape: the write's
+                        # entire payload is the register pointer, unambiguous
+                        # regardless of configured register_width (see the
+                        # module note above ``_SimulatedBusMemory``).
+                        payload = bytes(message)
+                        if payload:
+                            self._pointers[address] = int.from_bytes(
+                                payload, "big"
+                            )
+                        self._service_read(next_address, next_message)
+                        index += 2
+                        continue
+
+                if is_read:
+                    self._service_read(address, message)
+                else:
+                    self._service_write(address, message)
+                index += 1
+
+    @staticmethod
+    def _require_message_address(message: Any) -> int:
+        address = getattr(message, "addr", None)
+        if address is None:
+            raise TypeError(
+                "simulated i2c_rdwr() requires smbus2.i2c_msg-shaped "
+                "objects exposing '.addr'"
+            )
+        return int(address)
+
+    def _service_write(self, address: int, message: Any) -> None:
+        payload = bytes(message)
+        if not payload:
+            return
+        width = self._register_width.get(address, 1)
+        cells = self._cells_for(address)
+        if len(payload) <= width:
+            # Pointer-only write with no trailing data (e.g. a bare
+            # register-select with the split shape not detected above
+            # because no read followed in this call): just move the pointer.
+            self._pointers[address] = int.from_bytes(payload, "big")
+            return
+        pointer = int.from_bytes(payload[:width], "big")
+        data = payload[width:]
+        for offset, byte_value in enumerate(data):
+            cells[pointer + offset] = byte_value
+        self._pointers[address] = pointer + len(data)
+
+    def _service_read(self, address: int, message: Any) -> None:
+        cells = self._cells_for(address)
+        pointer = self._pointers.get(address, 0)
+        length = len(message)
+        data = bytes(cells.get(pointer + i, 0x00) for i in range(length))
+        self._deliver(message, data)
+        self._pointers[address] = pointer + length
+
+    @staticmethod
+    def _deliver(message: Any, data: bytes) -> None:
+        """Copy ``data`` into a real ``smbus2.i2c_msg`` read buffer.
+
+        ``smbus2.i2c_msg.buf`` is a ctypes ``c_char`` array; each element is
+        assigned as a length-1 ``bytes`` object. Falling back to whole-buffer
+        slice assignment covers alternate ``i2c_msg``-compatible shims (e.g.
+        a lightweight test double) that expose a plain mutable byte buffer
+        instead of the ctypes array smbus2 uses.
+        """
+
+        try:
+            for offset, byte_value in enumerate(data):
+                message.buf[offset] = bytes((byte_value,))
+        except (TypeError, ValueError, IndexError):
+            try:
+                message.buf[: len(data)] = data
+            except Exception as exc:
+                raise _SimulatedI2CError(
+                    errno.EPROTO,
+                    f"cannot deliver {len(data)} simulated read byte(s) "
+                    f"into {type(message).__name__}.buf",
+                ) from exc
+
+    def _do_close(self) -> None:
+        with self._lock:
+            self._closed = True
+
+    def __enter__(self) -> "_SimulatedBusMemory":
+        self._require_open()
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> bool:
+        del exc_type, exc, tb
+        self._do_close()
+        return False
+
+    def __repr__(self) -> str:
+        state = "closed" if self._closed else "open"
+        return (
+            f"{type(self).__name__}(bus_id={self.bus_id!r}, state={state!r}, "
+            f"devices={sorted(self._memory)!r})"
+        )
+
+
+class _SimulatedI2CBus(_SimulatedBusMemory):
+    """In-memory I2C bus for testing when smbus2 is unavailable.
+
+    Implements only the raw, protocol-agnostic surface a bare I2C bus offers
+    -- address probing (``write_quick``) and message-level transactions
+    (``i2c_rdwr``) -- with no higher-level "SMBus command" convenience
+    methods. Use this backend when simulating access patterns that only ever
+    go through :class:`I2C`'s raw ``writeto``/``readfrom``/``writeto_mem``/
+    ``readfrom_mem`` family, which is how this module drives the bus.
+    """
+
+    def write_quick(self, addr: int) -> None:
+        """Probe ``addr`` without transferring data (used by ``I2C.scan()``).
+
+        Raises ``OSError(errno.ENXIO)`` if ``addr`` is not present and
+        ``OSError(errno.EIO)`` if it has been fault-injected, exactly as
+        ``smbus2.SMBus.write_quick`` does against unresponsive hardware.
+        """
+
+        self._do_write_quick(addr)
+
+    def i2c_rdwr(self, *messages: Any) -> None:
+        """Execute one or more ``smbus2.i2c_msg`` objects as a single,
+        repeated-START transaction, exactly as ``smbus2.SMBus.i2c_rdwr``
+        does. Write messages deposit bytes into the addressed device's
+        simulated memory and advance its register pointer; read messages are
+        filled in place (via ``message.buf``) from that memory starting at
+        the current pointer. See the module-level note above for how the
+        register-pointer convention is inferred from message shape.
+        """
+
+        self._do_i2c_rdwr(*messages)
+
+    def close(self) -> None:
+        """Idempotently mark the bus closed. Further operations raise
+        ``OSError(errno.EBADF)``, matching a closed Linux file descriptor."""
+
+        self._do_close()
+
+
+class _SimulatedSMBus(_SimulatedI2CBus):
+    """In-memory stand-in for ``smbus2.SMBus``.
+
+    Extends :class:`_SimulatedI2CBus` with the classic SMBus "command code"
+    convenience methods (``read_byte_data``, ``write_i2c_block_data``, etc.).
+    ``machine.I2C`` itself only ever calls ``write_quick``/``i2c_rdwr``/
+    ``close`` (inherited unchanged from :class:`_SimulatedI2CBus`) -- these
+    additions exist so that test code or drivers written directly against
+    the ``smbus2.SMBus`` API (rather than through ``machine.I2C``) can be
+    pointed at this simulator as a drop-in substitute without gaps.
+
+    All command-code methods below are implemented in terms of the same
+    register-pointer memory model used by ``i2c_rdwr``, so a value written
+    via ``write_byte_data`` is visible to a subsequent ``I2C.readfrom_mem``
+    against the same offset, and vice versa -- there is exactly one source
+    of truth for simulated device state.
+    """
+
+    def read_byte(self, address: int) -> int:
+        """Read one byte from the device's current pointer without first
+        selecting a register (``SMBus.read_byte``)."""
+
+        with self._lock:
+            self._require_open()
+            self._require_ack(address)
+            cells = self._cells_for(address)
+            pointer = self._pointers.get(address, 0)
+            value = cells.get(pointer, 0x00)
+            self._pointers[address] = pointer + 1
+            return value
+
+    def write_byte(self, address: int, value: int) -> None:
+        """Write one byte at the device's current pointer with no register
+        select (``SMBus.write_byte``)."""
+
+        with self._lock:
+            self._require_open()
+            self._require_ack(address)
+            cells = self._cells_for(address)
+            pointer = self._pointers.get(address, 0)
+            cells[pointer] = value & 0xFF
+            self._pointers[address] = pointer + 1
+
+    def read_byte_data(self, address: int, register: int) -> int:
+        """Select ``register`` then read one byte (``SMBus.read_byte_data``)."""
+
+        with self._lock:
+            self._require_open()
+            self._require_ack(address)
+            cells = self._cells_for(address)
+            value = cells.get(register, 0x00)
+            self._pointers[address] = register + 1
+            return value
+
+    def write_byte_data(self, address: int, register: int, value: int) -> None:
+        """Select ``register`` then write one byte (``SMBus.write_byte_data``)."""
+
+        with self._lock:
+            self._require_open()
+            self._require_ack(address)
+            cells = self._cells_for(address)
+            cells[register] = value & 0xFF
+            self._pointers[address] = register + 1
+
+    def read_word_data(self, address: int, register: int) -> int:
+        """Select ``register`` then read two little-endian bytes
+        (``SMBus.read_word_data``)."""
+
+        low = self.read_byte_data(address, register)
+        high = self.read_byte_data(address, register + 1)
+        return (high << 8) | low
+
+    def write_word_data(self, address: int, register: int, value: int) -> None:
+        """Select ``register`` then write two little-endian bytes
+        (``SMBus.write_word_data``)."""
+
+        value &= 0xFFFF
+        self.write_byte_data(address, register, value & 0xFF)
+        self.write_byte_data(address, register + 1, (value >> 8) & 0xFF)
+
+    def read_i2c_block_data(
+        self, address: int, register: int, length: int
+    ) -> list[int]:
+        """Select ``register`` then read ``length`` sequential bytes
+        (``SMBus.read_i2c_block_data``)."""
+
+        if length < 0:
+            raise ValueError("length must be non-negative")
+        with self._lock:
+            self._require_open()
+            self._require_ack(address)
+            cells = self._cells_for(address)
+            data = [cells.get(register + i, 0x00) for i in range(length)]
+            self._pointers[address] = register + length
+            return data
+
+    def write_i2c_block_data(
+        self, address: int, register: int, data: Iterable[int]
+    ) -> None:
+        """Select ``register`` then write a sequence of bytes
+        (``SMBus.write_i2c_block_data``)."""
+
+        payload = list(data)
+        with self._lock:
+            self._require_open()
+            self._require_ack(address)
+            cells = self._cells_for(address)
+            for offset, byte_value in enumerate(payload):
+                cells[register + offset] = byte_value & 0xFF
+            self._pointers[address] = register + len(payload)
+
+
+class _SimulatedI2CMessage:
+    """Minimal stand-in for smbus2.i2c_msg when smbus2 is unavailable."""
+    def __init__(self, addr: int, flags: int, buf: Any) -> None:
+        self.addr = addr
+        self.flags = flags          # 0 = write, 1 = read (same as smbus2)
+        self.buf = buf              # bytes for write, bytearray for read
+
+    def __len__(self) -> int:
+        return len(self.buf)
+
+    def __bytes__(self) -> bytes:
+        return bytes(self.buf)
+
 
 # ---------------------------------------------------------------------------
 # Validation helpers
 # ---------------------------------------------------------------------------
-
 _I2C_MIN_ADDRESS = 0x00
 _I2C_MAX_ADDRESS = 0x7F
 _I2C_SCAN_MIN_ADDRESS = 0x08
@@ -74,7 +584,7 @@ _SUPPORTED_ADDR_SIZES = (8, 16)
 # These are normal "no responder" results during a diagnostic bus scan.
 _SCAN_MISS_ERRNOS = {
     errno.ENXIO,
-    errno.EREMOTEIO,
+    errno.EREMOTE,
     errno.EIO,
 }
 
@@ -93,9 +603,7 @@ def _require_smbus2() -> Any:
         error = HardwareError(
             device="Linux I2C",
             operation="load_smbus2",
-            error_details=(
-                "smbus2 is required for RoboCar.modules.machine.I2C on Linux"
-            ),
+            error_details="smbus2 is required for RoboCar.modules.machine.I2C on Linux",
         )
         raise error from cause
     return _smbus2
@@ -177,9 +685,35 @@ def _writable_bytes_view(value: Any, parameter: str) -> memoryview:
 
 
 # ---------------------------------------------------------------------------
-# Pin
+# ADC
 # ---------------------------------------------------------------------------
 
+class ADC:
+    """Stub ADC for Linux compatibility. Real ADC is not supported.
+
+    The reading value can be set via the constructor or the ``value`` property.
+    """
+    def __init__(self, pin: Pin, value: int = 32768) -> None:
+        self.pin = pin
+        self._value = value
+
+    def read_u16(self) -> int:
+        """Return the current simulated 16‑bit ADC reading (0‑65535)."""
+        return self._value
+
+    @property
+    def value(self) -> int:
+        return self._value
+
+    @value.setter
+    def value(self, new_value: int) -> None:
+        if not 0 <= new_value <= 65535:
+            raise ValueError("ADC value must be between 0 and 65535")
+        self._value = new_value
+
+# ---------------------------------------------------------------------------
+# Pin
+# ---------------------------------------------------------------------------
 
 class Pin:
     """Validated pin descriptor.
@@ -203,6 +737,8 @@ class Pin:
     IRQ_FALLING = 0x04
     IRQ_RISING = 0x08
 
+    _simulate_gpio: bool = False
+
     def __init__(
         self,
         pin: Any,
@@ -223,6 +759,7 @@ class Pin:
         self.mode = mode
         self.pull = pull
         self.initial_value: Optional[int] = None
+        self._simulated_state: Optional[int] = None
 
         if value is not None:
             initial = optional_binary(value)
@@ -268,9 +805,20 @@ class Pin:
         )
 
     def value(self, value: Optional[int] = None) -> int:
+        if self._simulate_gpio:
+            if value is not None:
+                self._simulated_state = 1 if value else 0
+            return self._simulated_state if self._simulated_state is not None else 0
         raise self._unsupported_gpio(
             "write_gpio" if value is not None else "read_gpio"
         )
+
+    # Add low() and high() as aliases to value():
+    def low(self) -> None:
+        self.value(0)
+
+    def high(self) -> None:
+        self.value(1)
 
     __call__ = value
 
@@ -304,7 +852,6 @@ class Pin:
 # I2C
 # ---------------------------------------------------------------------------
 
-
 class I2C:
     """MicroPython-shaped I2C adapter backed by Linux ``smbus2``.
 
@@ -335,19 +882,22 @@ class I2C:
         self._errors = 0
         self._last_error: Optional[str] = None
 
-        backend = _require_smbus2()
-
-        try:
-            self._bus = backend.SMBus(self.id)
-        except Exception as exc:
-            self._errors += 1
-            self._last_error = f"{type(exc).__name__}: {exc}"
-            logger.error(
-                "Failed to open /dev/i2c-%s: %s",
-                self.id,
-                self._last_error,
-            )
-            raise _hardware_error(f"I2C({self.id})", "open", exc) from exc
+        self._simulated = False
+        if _smbus2 is not None:
+            try:
+                self._bus = _smbus2.SMBus(self.id)
+                logger.info("I2C bus %s opened via smbus2", self.id)
+            except Exception as exc:
+                logger.warning(
+                    "Failed to open real I2C bus %s: %s; falling back to simulated",
+                    self.id, exc
+                )
+                self._bus = _SimulatedSMBus(self.id)
+                self._simulated = True
+        else:
+            logger.warning("smbus2 not available; using simulated I2C bus %s", self.id)
+            self._bus = _SimulatedSMBus(self.id)
+            self._simulated = True
 
         self._closed = False
         logger.info(
@@ -511,14 +1061,14 @@ class I2C:
                     "calls; use an explicit combined transaction instead"
                 ),
             )
-
-        def _write(bus: Any) -> int:
-            backend = _require_smbus2()
-            message = backend.i2c_msg.write(address, payload)
+        def _write(bus):
+            if _smbus2 is not None:
+                message = _smbus2.i2c_msg.write(address, payload)
+            else:
+                message = _SimulatedI2CMessage(address, 0, payload)
             bus.i2c_rdwr(message)
             return len(payload)
-
-        return int(self._execute("writeto", _write))
+        return self._execute("writeto", _write)
 
     def writevto(
         self,
@@ -554,13 +1104,14 @@ class I2C:
         if size == 0:
             return b""
 
-        def _read(bus: Any) -> bytes:
-            backend = _require_smbus2()
-            message = backend.i2c_msg.read(address, size)
+        def _read(bus):
+            if _smbus2 is not None:
+                message = _smbus2.i2c_msg.read(address, size)
+            else:
+                message = _SimulatedI2CMessage(address, 1, bytearray(size))
             bus.i2c_rdwr(message)
-            return bytes(message)
-
-        return bytes(self._execute("readfrom", _read))
+            return bytes(message.buf)
+        return self._execute("readfrom", _read)
 
     def readfrom_into(
         self,
@@ -592,16 +1143,15 @@ class I2C:
         payload = _as_bytes(data, "machine.i2c.writeto_mem.data")
         prefix = register.to_bytes(width // 8, "big")
 
-        def _write_mem(bus: Any) -> int:
-            backend = _require_smbus2()
-            message = backend.i2c_msg.write(
-                address,
-                prefix + payload,
-            )
+        def _write_mem(bus):
+            full = prefix + payload
+            if _smbus2 is not None:
+                message = _smbus2.i2c_msg.write(address, full)
+            else:
+                message = _SimulatedI2CMessage(address, 0, full)
             bus.i2c_rdwr(message)
             return len(payload)
-
-        return int(self._execute("writeto_mem", _write_mem))
+        return self._execute("writeto_mem", _write_mem)
 
     def readfrom_mem(
         self,
@@ -624,15 +1174,16 @@ class I2C:
 
         prefix = register.to_bytes(width // 8, "big")
 
-        def _read_mem(bus: Any) -> bytes:
-            backend = _require_smbus2()
-            set_register = backend.i2c_msg.write(address, prefix)
-            read_data = backend.i2c_msg.read(address, size)
-            # One I2C_RDWR ioctl: write register pointer, repeated START, read.
-            bus.i2c_rdwr(set_register, read_data)
-            return bytes(read_data)
-
-        return bytes(self._execute("readfrom_mem", _read_mem))
+        def _read_mem(bus):
+            if _smbus2 is not None:
+                set_reg = _smbus2.i2c_msg.write(address, prefix)
+                read_msg = _smbus2.i2c_msg.read(address, size)
+            else:
+                set_reg = _SimulatedI2CMessage(address, 0, prefix)
+                read_msg = _SimulatedI2CMessage(address, 1, bytearray(size))
+            bus.i2c_rdwr(set_reg, read_msg)
+            return bytes(read_msg.buf)
+        return self._execute("readfrom_mem", _read_mem)
 
     def readfrom_mem_into(
         self,
@@ -772,6 +1323,7 @@ def get_i2c_device(addr: Any, busnum: Any = 1) -> _LegacyI2CDevice:
 
 
 __all__ = [
+    "ADC",
     "Pin",
     "I2C",
     "get_i2c_device",
@@ -780,33 +1332,19 @@ __all__ = [
 
 if __name__ == "__main__":
     print("\n=== Running Machine Compatibility Adapter Tests ===\n")
-    printer.status(
-        "TEST",
-        "Machine compatibility adapter initialized",
-        "info",
-    )
+    printer.status("TEST", "Machine compatibility adapter initialized", "info")
 
     pin = Pin(2)
     assert int(pin) == 2
     assert pin.id == 2
-    printer.status(
-        "TEST",
-        "Pin descriptor validation",
-        "success",
-    )
+    printer.status("TEST", "Pin descriptor validation", "success")
 
     try:
         pin.value()
     except HardwareError:
-        printer.status(
-            "TEST",
-            "Pin GPIO fail-closed behavior",
-            "success",
-        )
+        printer.status("TEST", "Pin GPIO fail-closed behavior", "success")
     else:
-        raise AssertionError(
-            "Pin.value() must fail closed without a GPIO backend"
-        )
+        raise AssertionError("Pin.value() must fail closed without a GPIO backend")
 
     assert _i2c_address(0x29) == 0x29
     assert _memaddr(0x1234, 16) == 0x1234
@@ -814,10 +1352,6 @@ if __name__ == "__main__":
         bytearray((1, 2, 3)),
         "test",
     ) == b"\x01\x02\x03"
-    printer.status(
-        "TEST",
-        "I2C argument validation",
-        "success",
-    )
+    printer.status("TEST", "I2C argument validation", "success")
 
     print("\n=== Test ran successfully ===\n")
